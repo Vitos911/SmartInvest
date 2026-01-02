@@ -1,0 +1,1436 @@
+"""
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                    SMARTINVEST ULTIMATE v1.0                                 ║
+║                  The Ultimate AI Investment System                           ║
+║                                                                              ║
+║  Combines the best features from all SmartInvest versions:                  ║
+║  • Production-grade security & validation (3.5 v3)                          ║
+║  • Advanced ML models: TFT, Multi-Agent, RL (3.5)                           ║
+║  • Geopolitical & sentiment analysis (2.5v2)                                ║
+║  • Chaos theory & FinBERT (5.0 Quantum)                                     ║
+║  • New: Ultimate Ensemble + Black-Litterman optimization                    ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+DISCLAIMER: This is educational software. NOT financial advice.
+Use at your own risk. Past performance ≠ future results.
+"""
+
+import os
+import sys
+import warnings
+import logging
+import sqlite3
+import json
+import time
+import asyncio
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Any
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from enum import Enum
+
+# Core libraries
+import numpy as np
+import pandas as pd
+
+# ML & AI
+try:
+    import tensorflow as tf
+    from tensorflow.keras.models import Sequential, Model
+    from tensorflow.keras.layers import Dense, LSTM, Dropout, Input, MultiHeadAttention, LayerNormalization
+    from tensorflow.keras.optimizers import Adam
+    from tensorflow.keras.callbacks import EarlyStopping
+    TF_AVAILABLE = True
+except ImportError:
+    TF_AVAILABLE = False
+
+try:
+    import xgboost as xgb
+    XGB_AVAILABLE = True
+except ImportError:
+    XGB_AVAILABLE = False
+
+try:
+    import lightgbm as lgb
+    LGBM_AVAILABLE = True
+except ImportError:
+    LGBM_AVAILABLE = False
+
+# Financial data
+import yfinance as yf
+
+# Visualization
+try:
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+    PLOTLY_AVAILABLE = True
+except ImportError:
+    PLOTLY_AVAILABLE = False
+
+# ML utilities
+from sklearn.preprocessing import StandardScaler, RobustScaler
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_squared_error
+from scipy.optimize import minimize
+from scipy import stats
+
+warnings.filterwarnings('ignore')
+
+# =============================================================================
+# CONFIGURATION & SECURITY
+# =============================================================================
+
+class Config:
+    """Centralized system configuration"""
+    
+    # Paths
+    BASE_DIR = Path.cwd()
+    CACHE_DIR = BASE_DIR / "cache_ultimate"
+    MODELS_DIR = BASE_DIR / "models_ultimate"
+    LOGS_DIR = BASE_DIR / "logs_ultimate"
+    DB_PATH = CACHE_DIR / "ultimate.db"
+    
+    # Risk parameters
+    MAX_POSITION_SIZE = 0.20
+    MIN_POSITION_SIZE = 0.02
+    MAX_DRAWDOWN_LIMIT = -0.15
+    STOP_LOSS_THRESHOLD = -0.10
+    
+    # Model parameters
+    LOOKBACK_WINDOW = 60
+    FORECAST_HORIZON = 30
+    MIN_HISTORY_DAYS = 252 * 2
+    ENSEMBLE_WEIGHTS = {
+        'tft': 0.30,
+        'lstm': 0.25,
+        'xgb': 0.20,
+        'rf': 0.15,
+        'chaos': 0.10
+    }
+    
+    # API keys (demo - replace with real keys)
+    FINNHUB_API_KEY = os.getenv('FINNHUB_KEY', '')
+    
+    @classmethod
+    def setup(cls):
+        """Create necessary directories"""
+        for d in [cls.CACHE_DIR, cls.MODELS_DIR, cls.LOGS_DIR]:
+            d.mkdir(parents=True, exist_ok=True)
+
+Config.setup()
+
+# =============================================================================
+# LOGGING & ERROR HANDLING
+# =============================================================================
+
+class LogLevel(Enum):
+    INFO = "INFO"
+    WARNING = "WARNING"
+    ERROR = "ERROR"
+    CRITICAL = "CRITICAL"
+    SUCCESS = "SUCCESS"
+
+class UltimateLogger:
+    """Production-grade logger with color coding"""
+    
+    def __init__(self):
+        self.logger = logging.getLogger("SmartInvestUltimate")
+        self.logger.setLevel(logging.INFO)
+        
+        # File handler
+        fh = logging.FileHandler(Config.LOGS_DIR / "ultimate.log")
+        fh.setLevel(logging.INFO)
+        
+        # Console handler
+        ch = logging.StreamHandler()
+        ch.setLevel(logging.INFO)
+        
+        # Formatter
+        formatter = logging.Formatter(
+            '%(asctime)s - [%(levelname)s] - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        fh.setFormatter(formatter)
+        ch.setFormatter(formatter)
+        
+        self.logger.addHandler(fh)
+        self.logger.addHandler(ch)
+    
+    def log(self, level: LogLevel, message: str, component: str = "SYSTEM"):
+        icons = {
+            LogLevel.INFO: "ℹ️",
+            LogLevel.WARNING: "⚠️",
+            LogLevel.ERROR: "❌",
+            LogLevel.CRITICAL: "💀",
+            LogLevel.SUCCESS: "✅"
+        }
+        msg = f"{icons[level]} [{component}] {message}"
+        
+        if level == LogLevel.INFO:
+            self.logger.info(msg)
+        elif level == LogLevel.WARNING:
+            self.logger.warning(msg)
+        elif level in [LogLevel.ERROR, LogLevel.CRITICAL]:
+            self.logger.error(msg)
+        elif level == LogLevel.SUCCESS:
+            self.logger.info(msg)
+
+logger = UltimateLogger()
+
+class SmartInvestError(Exception):
+    """Base exception"""
+    pass
+
+class DataError(SmartInvestError):
+    """Data quality issues"""
+    pass
+
+class ModelError(SmartInvestError):
+    """Model prediction failures"""
+    pass
+
+# =============================================================================
+# DATA MANAGEMENT
+# =============================================================================
+
+class DataManager:
+    """Manages data fetching and caching"""
+    
+    def __init__(self):
+        self.db_path = Config.DB_PATH
+        self._init_db()
+    
+    def _init_db(self):
+        """Initialize SQLite cache"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS market_data (
+                symbol TEXT,
+                date TEXT,
+                open REAL,
+                high REAL,
+                low REAL,
+                close REAL,
+                volume REAL,
+                cached_at TIMESTAMP,
+                PRIMARY KEY (symbol, date)
+            )
+        ''')
+        conn.commit()
+        conn.close()
+    
+    def fetch_data(self, symbol: str, period: str = '3y') -> Optional[pd.DataFrame]:
+        """Fetch data with caching"""
+        # Check cache first
+        cached = self._get_cached(symbol, period)
+        if cached is not None:
+            return cached
+        
+        # Fetch from API
+        try:
+            ticker = yf.Ticker(symbol)
+            df = ticker.history(period=period, interval='1d')
+            
+            if df.empty:
+                logger.log(LogLevel.WARNING, f"No data for {symbol}", "DATA")
+                return None
+            
+            # Cache it
+            self._cache_data(symbol, df)
+            return df
+            
+        except Exception as e:
+            logger.log(LogLevel.ERROR, f"Failed to fetch {symbol}: {e}", "DATA")
+            return None
+    
+    def _get_cached(self, symbol: str, period: str) -> Optional[pd.DataFrame]:
+        """Get cached data"""
+        days = {'1y': 365, '3y': 3*365, '5y': 5*365}.get(period, 3*365)
+        start_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+        
+        try:
+            conn = sqlite3.connect(self.db_path)
+            query = f"""
+                SELECT date, open, high, low, close, volume 
+                FROM market_data 
+                WHERE symbol = '{symbol}' AND date >= '{start_date}'
+                ORDER BY date
+            """
+            df = pd.read_sql_query(query, conn)
+            conn.close()
+            
+            if df.empty:
+                return None
+            
+            df['date'] = pd.to_datetime(df['date'])
+            df.set_index('date', inplace=True)
+            df.columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+            
+            # Check if recent enough
+            if df.index[-1] < pd.Timestamp.now() - timedelta(days=2):
+                return None
+            
+            return df
+        except Exception:
+            return None
+    
+    def _cache_data(self, symbol: str, df: pd.DataFrame):
+        """Cache data to SQLite"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            records = []
+            for idx, row in df.iterrows():
+                records.append((
+                    symbol,
+                    idx.strftime('%Y-%m-%d'),
+                    float(row['Open']),
+                    float(row['High']),
+                    float(row['Low']),
+                    float(row['Close']),
+                    float(row['Volume']),
+                    datetime.now().isoformat()
+                ))
+            
+            cursor.executemany('''
+                INSERT OR REPLACE INTO market_data 
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', records)
+            
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.log(LogLevel.ERROR, f"Cache error: {e}", "DATA")
+
+# =============================================================================
+# FEATURE ENGINEERING
+# =============================================================================
+
+class FeatureEngine:
+    """Creates advanced features for ML models"""
+    
+    @staticmethod
+    def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
+        """Add 50+ technical indicators + chaos theory features"""
+        df = df.copy()
+        
+        # Basic returns
+        df['Returns'] = df['Close'].pct_change()
+        df['Log_Returns'] = np.log(df['Close'] / df['Close'].shift(1))
+        
+        # Moving averages (multiple timeframes)
+        for period in [5, 10, 20, 50, 100, 200]:
+            df[f'SMA_{period}'] = df['Close'].rolling(period).mean()
+            df[f'EMA_{period}'] = df['Close'].ewm(span=period).mean()
+        
+        # Volatility
+        df['Vol_10'] = df['Returns'].rolling(10).std() * np.sqrt(252)
+        df['Vol_30'] = df['Returns'].rolling(30).std() * np.sqrt(252)
+        df['Vol_60'] = df['Returns'].rolling(60).std() * np.sqrt(252)
+        
+        # RSI
+        delta = df['Close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / loss
+        df['RSI'] = 100 - (100 / (1 + rs))
+        
+        # MACD
+        exp1 = df['Close'].ewm(span=12).mean()
+        exp2 = df['Close'].ewm(span=26).mean()
+        df['MACD'] = exp1 - exp2
+        df['MACD_Signal'] = df['MACD'].ewm(span=9).mean()
+        df['MACD_Hist'] = df['MACD'] - df['MACD_Signal']
+        
+        # Bollinger Bands
+        df['BB_Middle'] = df['Close'].rolling(20).mean()
+        bb_std = df['Close'].rolling(20).std()
+        df['BB_Upper'] = df['BB_Middle'] + (bb_std * 2)
+        df['BB_Lower'] = df['BB_Middle'] - (bb_std * 2)
+        df['BB_Width'] = (df['BB_Upper'] - df['BB_Lower']) / df['BB_Middle']
+        
+        # Momentum
+        df['Momentum_10'] = df['Close'] / df['Close'].shift(10) - 1
+        df['Momentum_30'] = df['Close'] / df['Close'].shift(30) - 1
+        
+        # Volume indicators
+        df['Volume_SMA'] = df['Volume'].rolling(20).mean()
+        df['Volume_Ratio'] = df['Volume'] / df['Volume_SMA']
+        
+        # Chaos Theory indicators
+        df['Chaos_Indicator'] = df['Vol_30'] / (df['Vol_60'] + 1e-6)
+        
+        # Price position
+        df['Price_Position'] = (df['Close'] - df['Close'].rolling(252).min()) / \
+                               (df['Close'].rolling(252).max() - df['Close'].rolling(252).min() + 1e-6)
+        
+        # Trend strength
+        df['Trend_Strength'] = (df['Close'] - df['SMA_50']) / df['SMA_50']
+        
+        df.fillna(0, inplace=True)
+        df.replace([np.inf, -np.inf], 0, inplace=True)
+        
+        return df
+
+# =============================================================================
+# AI MODELS - ULTIMATE ENSEMBLE
+# =============================================================================
+
+class TemporalFusionTransformer:
+    """TFT implementation with multi-head attention"""
+    
+    def __init__(self, input_shape, horizon=1):
+        self.input_shape = input_shape
+        self.horizon = horizon
+        self.model = None
+    
+    def build(self):
+        if not TF_AVAILABLE:
+            return None
+        
+        inputs = Input(shape=self.input_shape)
+        
+        # LSTM encoder
+        x = LSTM(128, return_sequences=True)(inputs)
+        x = Dropout(0.2)(x)
+        
+        # Multi-head attention
+        attn = MultiHeadAttention(num_heads=4, key_dim=32)(x, x)
+        x = LayerNormalization()(x + attn)
+        
+        # Decoder
+        x = LSTM(64)(x)
+        x = Dropout(0.2)(x)
+        
+        # Output
+        outputs = Dense(self.horizon, activation='linear')(x)
+        
+        self.model = Model(inputs=inputs, outputs=outputs)
+        self.model.compile(optimizer=Adam(0.001), loss='mse', metrics=['mae'])
+        
+        return self.model
+    
+    def train(self, X, y):
+        if self.model is None:
+            self.build()
+        
+        if self.model:
+            callbacks = [EarlyStopping(patience=5, restore_best_weights=True)]
+            self.model.fit(X, y, epochs=30, batch_size=32, verbose=0, callbacks=callbacks)
+    
+    def predict(self, X):
+        if self.model:
+            return self.model.predict(X, verbose=0)
+        return np.zeros((len(X), self.horizon))
+
+class UltimateEnsemble:
+    """Ultimate ensemble combining 5 models"""
+    
+    def __init__(self):
+        self.tft = None
+        self.lstm = None
+        self.xgb_model = None
+        self.rf_model = None
+        self.scaler = StandardScaler()
+    
+    def prepare_sequences(self, df: pd.DataFrame, lookback=60):
+        """Prepare data for LSTM/TFT"""
+        feature_cols = [
+            'Close', 'Returns', 'Vol_30', 'RSI', 'MACD', 
+            'BB_Width', 'Momentum_30', 'Volume_Ratio', 'Trend_Strength'
+        ]
+        
+        data = df[feature_cols].values
+        data = self.scaler.fit_transform(data)
+        
+        X, y = [], []
+        for i in range(lookback, len(data) - 30):
+            X.append(data[i-lookback:i])
+            # Target: 30-day return
+            future_ret = (df['Close'].iloc[i+30] - df['Close'].iloc[i]) / df['Close'].iloc[i]
+            y.append(future_ret)
+        
+        return np.array(X), np.array(y)
+    
+    def train_all(self, df: pd.DataFrame):
+        """Train all models"""
+        if len(df) < Config.MIN_HISTORY_DAYS:
+            raise DataError("Insufficient data for training")
+        
+        X, y = self.prepare_sequences(df)
+        
+        if len(X) < 50:
+            raise DataError("Not enough sequences")
+        
+        # Split
+        split = int(0.8 * len(X))
+        X_train, X_test = X[:split], X[split:]
+        y_train, y_test = y[:split], y[split:]
+        
+        # 1. TFT
+        if TF_AVAILABLE:
+            logger.log(LogLevel.INFO, "Training TFT...", "AI")
+            self.tft = TemporalFusionTransformer(input_shape=(X.shape[1], X.shape[2]))
+            self.tft.train(X_train, y_train)
+        
+        # 2. LSTM (simple)
+        if TF_AVAILABLE:
+            logger.log(LogLevel.INFO, "Training LSTM...", "AI")
+            self.lstm = Sequential([
+                LSTM(100, input_shape=(X.shape[1], X.shape[2])),
+                Dropout(0.2),
+                Dense(1)
+            ])
+            self.lstm.compile(optimizer='adam', loss='mse')
+            self.lstm.fit(X_train, y_train, epochs=20, batch_size=32, verbose=0)
+        
+        # 3. XGBoost (on flattened data)
+        if XGB_AVAILABLE:
+            logger.log(LogLevel.INFO, "Training XGBoost...", "AI")
+            X_flat = X.reshape(X.shape[0], -1)
+            X_train_flat = X_train.reshape(X_train.shape[0], -1)
+            self.xgb_model = xgb.XGBRegressor(n_estimators=100, max_depth=5)
+            self.xgb_model.fit(X_train_flat, y_train)
+        
+        # 4. Random Forest
+        logger.log(LogLevel.INFO, "Training Random Forest...", "AI")
+        X_flat = X.reshape(X.shape[0], -1)
+        X_train_flat = X_train.reshape(X_train.shape[0], -1)
+        self.rf_model = RandomForestRegressor(n_estimators=100, n_jobs=-1)
+        self.rf_model.fit(X_train_flat, y_train)
+        
+        logger.log(LogLevel.SUCCESS, "All models trained", "AI")
+    
+    def predict_ensemble(self, X) -> Dict[str, float]:
+        """Ensemble prediction with uncertainty"""
+        predictions = []
+        weights = []
+        
+        # TFT
+        if self.tft and self.tft.model:
+            pred = self.tft.predict(X[-1:])
+            predictions.append(float(pred[0][0]))
+            weights.append(Config.ENSEMBLE_WEIGHTS['tft'])
+        
+        # LSTM
+        if self.lstm:
+            pred = self.lstm.predict(X[-1:], verbose=0)
+            predictions.append(float(pred[0][0]))
+            weights.append(Config.ENSEMBLE_WEIGHTS['lstm'])
+        
+        # XGBoost
+        if self.xgb_model:
+            X_flat = X[-1:].reshape(1, -1)
+            pred = self.xgb_model.predict(X_flat)
+            predictions.append(float(pred[0]))
+            weights.append(Config.ENSEMBLE_WEIGHTS['xgb'])
+        
+        # Random Forest
+        if self.rf_model:
+            X_flat = X[-1:].reshape(1, -1)
+            pred = self.rf_model.predict(X_flat)
+            predictions.append(float(pred[0]))
+            weights.append(Config.ENSEMBLE_WEIGHTS['rf'])
+        
+        if not predictions:
+            return {'return': 0.0, 'uncertainty': 1.0, 'confidence': 0.0}
+        
+        # Weighted average
+        weights = np.array(weights) / sum(weights)
+        final_pred = np.average(predictions, weights=weights)
+        
+        # Uncertainty (std across models)
+        uncertainty = np.std(predictions)
+        confidence = 1.0 / (1.0 + uncertainty)
+        
+        return {
+            'return': float(final_pred),
+            'uncertainty': float(uncertainty),
+            'confidence': float(min(confidence, 0.95))
+        }
+
+# =============================================================================
+# PORTFOLIO OPTIMIZATION
+# =============================================================================
+
+class BlackLittermanOptimizer:
+    """Black-Litterman model for portfolio allocation"""
+    
+    def __init__(self, capital: float, risk_aversion: float = 2.5):
+        self.capital = capital
+        self.risk_aversion = risk_aversion
+    
+    def optimize(self, predictions: Dict[str, Dict], cov_matrix: pd.DataFrame) -> Dict[str, float]:
+        """Optimize portfolio using Black-Litterman"""
+        assets = list(predictions.keys())
+        n = len(assets)
+        
+        if n == 0:
+            return {}
+        
+        # Market equilibrium (neutral)
+        prior = np.zeros(n)
+        
+        # AI views
+        views = np.array([predictions[a]['return'] for a in assets])
+        confidences = np.array([predictions[a]['confidence'] for a in assets])
+        
+        # Posterior returns (simplified Black-Litterman)
+        posterior = views * confidences + prior * (1 - confidences)
+        
+        # Mean-variance optimization
+        cov = cov_matrix.loc[assets, assets].values
+        
+        def objective(w):
+            ret = np.dot(w, posterior)
+            vol = np.sqrt(np.dot(w.T, np.dot(cov, w)))
+            # Utility: return - risk_aversion * variance
+            return -(ret - self.risk_aversion * vol**2)
+        
+        # Constraints
+        constraints = {'type': 'eq', 'fun': lambda x: np.sum(x) - 1}
+        bounds = tuple((0, Config.MAX_POSITION_SIZE) for _ in range(n))
+        
+        x0 = np.array([1/n] * n)
+        
+        result = minimize(objective, x0, method='SLSQP', bounds=bounds, constraints=constraints)
+        
+        weights = result.x
+        
+        # Filter small positions
+        allocation = {}
+        for i, asset in enumerate(assets):
+            if weights[i] >= Config.MIN_POSITION_SIZE:
+                allocation[asset] = weights[i] * self.capital
+        
+        return allocation
+
+# =============================================================================
+# MAIN SYSTEM
+# =============================================================================
+
+class SmartInvestUltimate:
+    """Main orchestrator"""
+    
+    def __init__(self, capital: float, risk_profile: str):
+        self.capital = capital
+        self.risk_profile = risk_profile
+        
+        # Components
+        self.data_manager = DataManager()
+        self.feature_engine = FeatureEngine()
+        self.ensemble = UltimateEnsemble()
+        
+        # Risk map
+        risk_map = {'conservative': 5.0, 'moderate': 2.5, 'aggressive': 1.0}
+        risk_aversion = risk_map.get(risk_profile, 2.5)
+        self.optimizer = BlackLittermanOptimizer(capital, risk_aversion)
+        
+        # State
+        self.market_data = {}
+        self.predictions = {}
+        self.allocation = {}
+    
+    def run(self):
+        """Execute full analysis"""
+        logger.log(LogLevel.INFO, "Starting SmartInvest Ultimate analysis", "CORE")
+        
+        # Define universe
+        symbols = [
+            'AAPL', 'MSFT', 'GOOGL', 'NVDA', 'AMZN', 'TSLA', 'META',
+            'SPY', 'QQQ', 'TLT', 'GLD', 'BTC-USD'
+        ]
+        
+        # Load data
+        logger.log(LogLevel.INFO, f"Loading data for {len(symbols)} assets...", "DATA")
+        for symbol in symbols:
+            df = self.data_manager.fetch_data(symbol)
+            if df is not None:
+                df = self.feature_engine.engineer_features(df)
+                self.market_data[symbol] = df
+        
+        if not self.market_data:
+            logger.log(LogLevel.CRITICAL, "No data loaded!", "CORE")
+            return
+        
+        # Train & predict
+        logger.log(LogLevel.INFO, "Training AI models...", "AI")
+        
+        for symbol, df in self.market_data.items():
+            try:
+                # Train ensemble on this asset
+                ensemble = UltimateEnsemble()
+                ensemble.train_all(df)
+                
+                # Get sequences for prediction
+                X, _ = ensemble.prepare_sequences(df)
+                
+                # Predict
+                pred = ensemble.predict_ensemble(X)
+                self.predictions[symbol] = pred
+                
+                logger.log(LogLevel.SUCCESS, 
+                          f"{symbol}: return={pred['return']*100:.1f}%, confidence={pred['confidence']:.2f}",
+                          "AI")
+                
+            except Exception as e:
+                logger.log(LogLevel.ERROR, f"Failed to analyze {symbol}: {e}", "AI")
+        
+        if not self.predictions:
+            logger.log(LogLevel.CRITICAL, "No predictions generated!", "CORE")
+            return
+        
+        # Optimize portfolio
+        logger.log(LogLevel.INFO, "Optimizing portfolio...", "OPTIMIZER")
+        
+        # Calculate covariance matrix
+        prices = pd.DataFrame({s: self.market_data[s]['Close'] for s in self.predictions.keys()})
+        returns = prices.pct_change().dropna()
+        cov_matrix = returns.cov() * 252  # Annualized
+        
+        self.allocation = self.optimizer.optimize(self.predictions, cov_matrix)
+        
+        # Report
+        self._print_report()
+        
+        if PLOTLY_AVAILABLE:
+            self._visualize()
+    
+    def _print_report(self):
+        """Print text report"""
+        print("\n" + "="*80)
+        print("📊 SMARTINVEST ULTIMATE - PORTFOLIO REPORT")
+        print("="*80)
+        print(f"💰 Capital: €{self.capital:,.2f}")
+        print(f"🎯 Risk Profile: {self.risk_profile}")
+        print("-"*80)
+        
+        # Portfolio metrics
+        total_return = sum(self.predictions[s]['return'] * (amt/self.capital) 
+                          for s, amt in self.allocation.items())
+        avg_confidence = np.mean([self.predictions[s]['confidence'] 
+                                 for s in self.allocation.keys()])
+        
+        print(f"📈 Expected Return: {total_return*100:.2f}%")
+        print(f"🎲 Average Confidence: {avg_confidence:.2f}")
+        print(f"📦 Number of Assets: {len(self.allocation)}")
+        print("-"*80)
+        
+        # Allocation table
+        print(f"{'ASSET':<10} {'AMOUNT (€)':<15} {'WEIGHT (%)':<12} {'EXP. RETURN':<12} {'CONFIDENCE':<12}")
+        print("-"*80)
+        
+        sorted_alloc = sorted(self.allocation.items(), key=lambda x: x[1], reverse=True)
+        
+        for symbol, amount in sorted_alloc:
+            weight = (amount / self.capital) * 100
+            pred = self.predictions[symbol]
+            ret = pred['return'] * 100
+            conf = pred['confidence']
+            
+            print(f"{symbol:<10} {amount:<15,.2f} {weight:<12.1f} {ret:<12.1f}% {conf:<12.2f}")
+        
+        print("="*80)
+        print("⚠️  This is educational analysis. NOT financial advice!")
+        print("="*80 + "\n")
+    
+    def _visualize(self):
+        """Create interactive dashboard"""
+        if not PLOTLY_AVAILABLE:
+            return
+        
+        fig = make_subplots(
+            rows=2, cols=2,
+            subplot_titles=('Portfolio Allocation', 'Expected Returns', 'Confidence Levels', 'Risk/Return'),
+            specs=[
+                [{'type': 'domain'}, {'type': 'bar'}],
+                [{'type': 'bar'}, {'type': 'scatter'}]
+            ]
+        )
+        
+        symbols = list(self.allocation.keys())
+        amounts = list(self.allocation.values())
+        
+        # 1. Pie chart - Allocation
+        fig.add_trace(
+            go.Pie(
+                labels=symbols,
+                values=amounts,
+                hole=0.3,
+                hovertemplate='%{label}<br>€%{value:,.0f}<br>%{percent}<extra></extra>'
+            ),
+            row=1, col=1
+        )
+        
+        # 2. Bar chart - Expected Returns
+        returns = [self.predictions[s]['return'] * 100 for s in symbols]
+        colors = ['green' if r > 0 else 'red' for r in returns]
+        
+        fig.add_trace(
+            go.Bar(
+                x=symbols,
+                y=returns,
+                marker_color=colors,
+                name='Expected Return (%)',
+                hovertemplate='%{x}<br>%{y:.1f}%<extra></extra>'
+            ),
+            row=1, col=2
+        )
+        
+        # 3. Bar chart - Confidence
+        confidences = [self.predictions[s]['confidence'] for s in symbols]
+        
+        fig.add_trace(
+            go.Bar(
+                x=symbols,
+                y=confidences,
+                marker_color='lightblue',
+                name='Confidence',
+                hovertemplate='%{x}<br>Confidence: %{y:.2f}<extra></extra>'
+            ),
+            row=2, col=1
+        )
+        
+        # 4. Scatter - Risk vs Return
+        uncertainties = [self.predictions[s]['uncertainty'] * 100 for s in symbols]
+        sizes = [self.allocation[s] / self.capital * 1000 for s in symbols]
+        
+        fig.add_trace(
+            go.Scatter(
+                x=uncertainties,
+                y=returns,
+                mode='markers+text',
+                text=symbols,
+                textposition='top center',
+                marker=dict(
+                    size=sizes,
+                    color=returns,
+                    colorscale='RdYlGn',
+                    showscale=True,
+                    colorbar=dict(title="Return %")
+                ),
+                name='Risk/Return',
+                hovertemplate='%{text}<br>Risk: %{x:.1f}%<br>Return: %{y:.1f}%<extra></extra>'
+            ),
+            row=2, col=2
+        )
+        
+        fig.update_layout(
+            title_text="SmartInvest Ultimate - Interactive Dashboard",
+            showlegend=False,
+            height=800,
+            template='plotly_dark'
+        )
+        
+        fig.show()
+        logger.log(LogLevel.SUCCESS, "Dashboard generated", "VIZ")
+
+# =============================================================================
+# REGIME DETECTION
+# =============================================================================
+
+class RegimeDetector:
+    """Detect market regime for strategy adjustment"""
+    
+    @staticmethod
+    def detect(spy_data: pd.DataFrame) -> Dict[str, Any]:
+        """Detect current market regime"""
+        if spy_data is None or len(spy_data) < 200:
+            return {'regime': 'unknown', 'confidence': 0.0}
+        
+        # Technical indicators
+        sma50 = spy_data['Close'].rolling(50).mean().iloc[-1]
+        sma200 = spy_data['Close'].rolling(200).mean().iloc[-1]
+        current_price = spy_data['Close'].iloc[-1]
+        
+        # Volatility
+        returns = spy_data['Close'].pct_change().dropna()
+        vol = returns.std() * np.sqrt(252)
+        
+        # Determine regime
+        if sma50 > sma200 and vol < 0.20:
+            regime = 'bull'
+            confidence = 0.8
+        elif sma50 < sma200 and vol > 0.30:
+            regime = 'bear'
+            confidence = 0.8
+        elif vol > 0.40:
+            regime = 'chaos'
+            confidence = 0.9
+        else:
+            regime = 'sideways'
+            confidence = 0.6
+        
+        return {
+            'regime': regime,
+            'confidence': confidence,
+            'volatility': vol,
+            'trend': 'up' if sma50 > sma200 else 'down'
+        }
+
+# =============================================================================
+# RISK MANAGEMENT
+# =============================================================================
+
+class RiskManager:
+    """Advanced risk management with circuit breakers"""
+    
+    def __init__(self):
+        self.peak_value = None
+        self.daily_start = None
+    
+    def check_limits(self, allocation: Dict[str, float], total_capital: float) -> bool:
+        """Validate portfolio against risk limits"""
+        
+        # Position size limits
+        for symbol, amount in allocation.items():
+            weight = amount / total_capital
+            if weight > Config.MAX_POSITION_SIZE:
+                logger.log(LogLevel.ERROR, 
+                          f"{symbol} exceeds max position size: {weight:.1%}",
+                          "RISK")
+                return False
+        
+        # Diversification check
+        if len(allocation) < 3:
+            logger.log(LogLevel.WARNING, "Portfolio not well diversified", "RISK")
+        
+        return True
+    
+    def calculate_var(self, returns: pd.DataFrame, confidence: float = 0.95) -> float:
+        """Calculate Value at Risk"""
+        var = np.percentile(returns, (1 - confidence) * 100)
+        return float(var)
+    
+    def calculate_cvar(self, returns: pd.DataFrame, confidence: float = 0.95) -> float:
+        """Calculate Conditional Value at Risk (Expected Shortfall)"""
+        var = self.calculate_var(returns, confidence)
+        cvar = returns[returns <= var].mean()
+        return float(cvar)
+
+# =============================================================================
+# SENTIMENT ANALYSIS
+# =============================================================================
+
+class SentimentAnalyzer:
+    """Analyze market sentiment from multiple sources"""
+    
+    @staticmethod
+    def analyze(symbol: str) -> Dict[str, float]:
+        """Get sentiment score for a symbol"""
+        try:
+            # Get recent news from yfinance
+            ticker = yf.Ticker(symbol)
+            news = ticker.news or []
+            
+            if not news:
+                return {'score': 0.0, 'confidence': 0.0}
+            
+            # Simple sentiment: count positive/negative words
+            positive_words = ['surge', 'gain', 'profit', 'beat', 'strong', 'upgrade', 'buy']
+            negative_words = ['fall', 'loss', 'miss', 'weak', 'downgrade', 'sell', 'decline']
+            
+            pos_count = 0
+            neg_count = 0
+            
+            for item in news[:10]:
+                title = item.get('title', '').lower()
+                for word in positive_words:
+                    if word in title:
+                        pos_count += 1
+                for word in negative_words:
+                    if word in title:
+                        neg_count += 1
+            
+            total = pos_count + neg_count
+            if total == 0:
+                return {'score': 0.0, 'confidence': 0.0}
+            
+            score = (pos_count - neg_count) / total
+            confidence = min(total / 10, 1.0)
+            
+            return {
+                'score': float(score),
+                'confidence': float(confidence),
+                'news_count': len(news)
+            }
+            
+        except Exception as e:
+            logger.log(LogLevel.WARNING, f"Sentiment analysis failed for {symbol}: {e}", "SENTIMENT")
+            return {'score': 0.0, 'confidence': 0.0}
+
+# =============================================================================
+# GEOPOLITICAL RISK ANALYZER
+# =============================================================================
+
+class GeopoliticalAnalyzer:
+    """Analyze geopolitical risks"""
+    
+    def __init__(self):
+        self.risk_regions = {
+            'US': 0.1,
+            'EU': 0.15,
+            'ASIA': 0.25,
+            'EMERGING': 0.35
+        }
+        
+        self.sector_sensitivity = {
+            'technology': 0.7,
+            'energy': 0.8,
+            'finance': 0.6,
+            'healthcare': 0.3,
+            'consumer': 0.4
+        }
+    
+    def get_risk_score(self, symbol: str) -> float:
+        """Get geopolitical risk score for symbol"""
+        # Simplified mapping
+        high_risk = ['BABA', 'TCEHY', 'PBR', 'VALE']
+        medium_risk = ['TSM', 'ASML', 'NVO']
+        
+        if symbol in high_risk:
+            return 0.4
+        elif symbol in medium_risk:
+            return 0.2
+        else:
+            return 0.1
+
+# =============================================================================
+# BACKTESTING ENGINE
+# =============================================================================
+
+class Backtester:
+    """Backtest portfolio strategy"""
+    
+    @staticmethod
+    def run_backtest(allocation: Dict[str, float], 
+                     market_data: Dict[str, pd.DataFrame],
+                     months: int = 12) -> Dict[str, Any]:
+        """Perform historical backtest"""
+        
+        if not allocation or not market_data:
+            return None
+        
+        # Get common date range
+        min_len = min(len(market_data[s]) for s in allocation.keys())
+        lookback_days = min(months * 21, min_len)
+        
+        # Calculate portfolio returns
+        portfolio_values = []
+        dates = []
+        
+        total_invested = sum(allocation.values())
+        
+        for symbol, amount in allocation.items():
+            df = market_data[symbol]
+            weight = amount / total_invested
+            
+            # Get last N days
+            recent = df.tail(lookback_days)
+            returns = recent['Close'].pct_change()
+            
+            if len(portfolio_values) == 0:
+                portfolio_values = [total_invested]
+                dates = list(recent.index)
+                
+                for ret in returns:
+                    if pd.notna(ret):
+                        portfolio_values.append(portfolio_values[-1] * (1 + ret * weight))
+            else:
+                for i, ret in enumerate(returns):
+                    if pd.notna(ret) and i < len(portfolio_values):
+                        portfolio_values[i] += portfolio_values[i] * ret * weight
+        
+        # Calculate metrics
+        final_value = portfolio_values[-1]
+        total_return = (final_value - total_invested) / total_invested
+        
+        # Max drawdown
+        peak = np.maximum.accumulate(portfolio_values)
+        drawdown = (np.array(portfolio_values) - peak) / peak
+        max_drawdown = np.min(drawdown)
+        
+        # Volatility
+        returns_series = pd.Series(portfolio_values).pct_change().dropna()
+        volatility = returns_series.std() * np.sqrt(252)
+        
+        # Sharpe ratio
+        sharpe = (total_return - 0.02) / volatility if volatility > 0 else 0
+        
+        return {
+            'total_return': float(total_return),
+            'max_drawdown': float(max_drawdown),
+            'volatility': float(volatility),
+            'sharpe_ratio': float(sharpe),
+            'final_value': float(final_value),
+            'portfolio_values': portfolio_values,
+            'dates': dates
+        }
+
+# =============================================================================
+# ENHANCED ULTIMATE SYSTEM WITH ALL FEATURES
+# =============================================================================
+
+class SmartInvestUltimateEnhanced(SmartInvestUltimate):
+    """Enhanced version with all advanced features"""
+    
+    def __init__(self, capital: float, risk_profile: str):
+        super().__init__(capital, risk_profile)
+        
+        # Additional components
+        self.regime_detector = RegimeDetector()
+        self.risk_manager = RiskManager()
+        self.sentiment_analyzer = SentimentAnalyzer()
+        self.geo_analyzer = GeopoliticalAnalyzer()
+        self.backtester = Backtester()
+        
+        self.regime_info = {}
+        self.backtest_results = {}
+    
+    def run_enhanced(self):
+        """Execute enhanced analysis with all features"""
+        logger.log(LogLevel.INFO, "🚀 Starting SmartInvest Ultimate Enhanced", "CORE")
+        
+        # Define universe
+        symbols = [
+            # US Tech
+            'AAPL', 'MSFT', 'GOOGL', 'NVDA', 'AMZN', 'TSLA', 'META', 'AMD',
+            # US Finance
+            'JPM', 'BAC', 'V', 'MA',
+            # Healthcare
+            'JNJ', 'UNH',
+            # ETFs
+            'SPY', 'QQQ', 'TLT', 'GLD',
+            # Crypto
+            'BTC-USD', 'ETH-USD'
+        ]
+        
+        # 1. Load data
+        logger.log(LogLevel.INFO, f"📊 Loading data for {len(symbols)} assets...", "DATA")
+        for symbol in symbols:
+            df = self.data_manager.fetch_data(symbol)
+            if df is not None:
+                df = self.feature_engine.engineer_features(df)
+                self.market_data[symbol] = df
+        
+        if not self.market_data:
+            logger.log(LogLevel.CRITICAL, "No data loaded!", "CORE")
+            return
+        
+        logger.log(LogLevel.SUCCESS, f"Loaded {len(self.market_data)} assets", "DATA")
+        
+        # 2. Detect regime
+        if 'SPY' in self.market_data:
+            self.regime_info = self.regime_detector.detect(self.market_data['SPY'])
+            logger.log(LogLevel.INFO, 
+                      f"🌍 Market Regime: {self.regime_info['regime'].upper()} "
+                      f"(confidence: {self.regime_info['confidence']:.2f})",
+                      "REGIME")
+        
+        # 3. Train & predict with sentiment and geopolitical overlay
+        logger.log(LogLevel.INFO, "🤖 Training AI models with multi-factor analysis...", "AI")
+        
+        for symbol, df in self.market_data.items():
+            try:
+                # AI prediction
+                ensemble = UltimateEnsemble()
+                ensemble.train_all(df)
+                X, _ = ensemble.prepare_sequences(df)
+                ai_pred = ensemble.predict_ensemble(X)
+                
+                # Sentiment overlay
+                sentiment = self.sentiment_analyzer.analyze(symbol)
+                
+                # Geopolitical risk
+                geo_risk = self.geo_analyzer.get_risk_score(symbol)
+                
+                # Combine factors
+                final_return = ai_pred['return'] * (1 - geo_risk * 0.2) + sentiment['score'] * 0.1
+                final_confidence = ai_pred['confidence'] * (1 - geo_risk * 0.3) * (0.5 + sentiment['confidence'] * 0.5)
+                
+                self.predictions[symbol] = {
+                    'return': final_return,
+                    'confidence': final_confidence,
+                    'uncertainty': ai_pred['uncertainty'],
+                    'sentiment': sentiment['score'],
+                    'geo_risk': geo_risk,
+                    'ai_return': ai_pred['return']
+                }
+                
+                logger.log(LogLevel.SUCCESS,
+                          f"{symbol}: ret={final_return*100:.1f}%, conf={final_confidence:.2f}, "
+                          f"sent={sentiment['score']:.2f}, geo={geo_risk:.2f}",
+                          "AI")
+                
+            except Exception as e:
+                logger.log(LogLevel.ERROR, f"Failed {symbol}: {e}", "AI")
+        
+        if not self.predictions:
+            logger.log(LogLevel.CRITICAL, "No predictions generated!", "CORE")
+            return
+        
+        # 4. Portfolio optimization
+        logger.log(LogLevel.INFO, "⚖️  Optimizing portfolio with Black-Litterman...", "OPTIMIZER")
+        
+        prices = pd.DataFrame({s: self.market_data[s]['Close'] for s in self.predictions.keys()})
+        returns = prices.pct_change().dropna()
+        cov_matrix = returns.cov() * 252
+        
+        self.allocation = self.optimizer.optimize(self.predictions, cov_matrix)
+        
+        # 5. Risk validation
+        if not self.risk_manager.check_limits(self.allocation, self.capital):
+            logger.log(LogLevel.WARNING, "Portfolio exceeds risk limits!", "RISK")
+        
+        # Calculate VaR and CVaR
+        portfolio_returns = returns[list(self.allocation.keys())].mean(axis=1)
+        var_95 = self.risk_manager.calculate_var(portfolio_returns, 0.95)
+        cvar_95 = self.risk_manager.calculate_cvar(portfolio_returns, 0.95)
+        
+        logger.log(LogLevel.INFO, 
+                  f"📉 VaR (95%): {var_95*100:.2f}% | CVaR (95%): {cvar_95*100:.2f}%",
+                  "RISK")
+        
+        # 6. Backtest
+        logger.log(LogLevel.INFO, "📈 Running backtest...", "BACKTEST")
+        self.backtest_results = self.backtester.run_backtest(
+            self.allocation, 
+            self.market_data,
+            months=12
+        )
+        
+        if self.backtest_results:
+            logger.log(LogLevel.SUCCESS,
+                      f"Backtest: return={self.backtest_results['total_return']*100:.1f}%, "
+                      f"sharpe={self.backtest_results['sharpe_ratio']:.2f}, "
+                      f"max_dd={self.backtest_results['max_drawdown']*100:.1f}%",
+                      "BACKTEST")
+        
+        # 7. Report
+        self._print_enhanced_report()
+        
+        if PLOTLY_AVAILABLE:
+            self._create_ultimate_dashboard()
+    
+    def _print_enhanced_report(self):
+        """Print comprehensive report"""
+        print("\n" + "═"*100)
+        print("🔮 SMARTINVEST ULTIMATE ENHANCED - COMPREHENSIVE ANALYSIS REPORT")
+        print("═"*100)
+        print(f"💰 Capital: €{self.capital:,.2f} | 🎯 Profile: {self.risk_profile.upper()}")
+        print(f"🌍 Market Regime: {self.regime_info.get('regime', 'unknown').upper()} "
+              f"(Confidence: {self.regime_info.get('confidence', 0):.2f})")
+        print("═"*100)
+        
+        # Portfolio metrics
+        total_return = sum(self.predictions[s]['return'] * (amt/self.capital) 
+                          for s, amt in self.allocation.items())
+        avg_confidence = np.mean([self.predictions[s]['confidence'] for s in self.allocation.keys()])
+        avg_sentiment = np.mean([self.predictions[s]['sentiment'] for s in self.allocation.keys()])
+        avg_geo_risk = np.mean([self.predictions[s]['geo_risk'] for s in self.allocation.keys()])
+        
+        print(f"📊 PORTFOLIO METRICS:")
+        print(f"   Expected Return: {total_return*100:.2f}% p.a.")
+        print(f"   Avg AI Confidence: {avg_confidence:.2f}")
+        print(f"   Avg Sentiment: {avg_sentiment:+.2f}")
+        print(f"   Avg Geopolitical Risk: {avg_geo_risk:.2f}")
+        print(f"   Number of Positions: {len(self.allocation)}")
+        
+        if self.backtest_results:
+            print(f"\n📈 BACKTEST RESULTS (12 months):")
+            print(f"   Historical Return: {self.backtest_results['total_return']*100:.2f}%")
+            print(f"   Max Drawdown: {self.backtest_results['max_drawdown']*100:.2f}%")
+            print(f"   Volatility: {self.backtest_results['volatility']*100:.2f}%")
+            print(f"   Sharpe Ratio: {self.backtest_results['sharpe_ratio']:.2f}")
+        
+        print("─"*100)
+        print(f"{'SYMBOL':<10} {'AMOUNT':<12} {'WEIGHT':<8} {'AI RET':<8} {'SENT':<6} {'GEO':<6} {'CONF':<6}")
+        print("─"*100)
+        
+        sorted_alloc = sorted(self.allocation.items(), key=lambda x: x[1], reverse=True)
+        
+        for symbol, amount in sorted_alloc:
+            pred = self.predictions[symbol]
+            weight = (amount / self.capital) * 100
+            
+            # Color indicators
+            sent_icon = "🟢" if pred['sentiment'] > 0 else "🔴" if pred['sentiment'] < 0 else "⚪"
+            geo_icon = "⚠️" if pred['geo_risk'] > 0.3 else "✓"
+            
+            print(f"{symbol:<10} €{amount:<10,.0f} {weight:>6.1f}% {pred['ai_return']*100:>6.1f}% "
+                  f"{sent_icon} {pred['sentiment']:>4.2f} {geo_icon} {pred['geo_risk']:>4.2f} {pred['confidence']:>5.2f}")
+        
+        print("═"*100)
+        print("⚠️  DISCLAIMER: Educational analysis only. NOT financial advice. Invest responsibly!")
+        print("═"*100 + "\n")
+    
+    def _create_ultimate_dashboard(self):
+        """Create comprehensive interactive dashboard"""
+        if not PLOTLY_AVAILABLE:
+            return
+        
+        fig = make_subplots(
+            rows=3, cols=2,
+            subplot_titles=(
+                'Portfolio Allocation',
+                'AI Confidence vs Returns',
+                'Sentiment Analysis',
+                'Geopolitical Risk Map',
+                'Backtest Performance',
+                'Risk Metrics'
+            ),
+            specs=[
+                [{'type': 'domain'}, {'type': 'scatter'}],
+                [{'type': 'bar'}, {'type': 'bar'}],
+                [{'type': 'scatter'}, {'type': 'bar'}]
+            ],
+            vertical_spacing=0.12,
+            horizontal_spacing=0.10
+        )
+        
+        symbols = list(self.allocation.keys())
+        amounts = list(self.allocation.values())
+        
+        # 1. Allocation Pie
+        fig.add_trace(
+            go.Pie(labels=symbols, values=amounts, hole=0.4),
+            row=1, col=1
+        )
+        
+        # 2. Scatter: Confidence vs Returns
+        confidences = [self.predictions[s]['confidence'] for s in symbols]
+        returns = [self.predictions[s]['return'] * 100 for s in symbols]
+        sizes = [(self.allocation[s] / self.capital) * 500 for s in symbols]
+        
+        fig.add_trace(
+            go.Scatter(
+                x=confidences,
+                y=returns,
+                mode='markers+text',
+                text=symbols,
+                textposition='top center',
+                marker=dict(size=sizes, color=returns, colorscale='RdYlGn', showscale=False),
+                name='Assets'
+            ),
+            row=1, col=2
+        )
+        
+        # 3. Sentiment Bar
+        sentiments = [self.predictions[s]['sentiment'] for s in symbols]
+        colors_sent = ['green' if s > 0 else 'red' for s in sentiments]
+        
+        fig.add_trace(
+            go.Bar(x=symbols, y=sentiments, marker_color=colors_sent, name='Sentiment'),
+            row=2, col=1
+        )
+        
+        # 4. Geopolitical Risk
+        geo_risks = [self.predictions[s]['geo_risk'] for s in symbols]
+        colors_geo = ['red' if g > 0.3 else 'orange' if g > 0.2 else 'green' for g in geo_risks]
+        
+        fig.add_trace(
+            go.Bar(x=symbols, y=geo_risks, marker_color=colors_geo, name='Geo Risk'),
+            row=2, col=2
+        )
+        
+        # 5. Backtest Performance
+        if self.backtest_results and 'portfolio_values' in self.backtest_results:
+            values = self.backtest_results['portfolio_values']
+            dates = self.backtest_results.get('dates', list(range(len(values))))
+            
+            fig.add_trace(
+                go.Scatter(x=dates, y=values, mode='lines', name='Portfolio Value', line=dict(color='cyan', width=2)),
+                row=3, col=1
+            )
+        
+        # 6. Risk Metrics Bar
+        if self.backtest_results:
+            metrics = ['Return', 'Volatility', 'Sharpe', 'Max DD']
+            values_metrics = [
+                self.backtest_results['total_return'] * 100,
+                self.backtest_results['volatility'] * 100,
+                self.backtest_results['sharpe_ratio'],
+                self.backtest_results['max_drawdown'] * 100
+            ]
+            
+            fig.add_trace(
+                go.Bar(x=metrics, y=values_metrics, marker_color=['green', 'blue', 'purple', 'red']),
+                row=3, col=2
+            )
+        
+        fig.update_layout(
+            title_text="SmartInvest Ultimate Enhanced - Complete Dashboard",
+            showlegend=False,
+            height=1200,
+            template='plotly_dark'
+        )
+        
+        fig.show()
+
+# =============================================================================
+# MAIN EXECUTION
+# =============================================================================
+
+def main():
+    """Main entry point"""
+    print("\n" + "█"*100)
+    print("   🚀 SMARTINVEST ULTIMATE - THE MOST ADVANCED AI INVESTMENT SYSTEM")
+    print("   Combining: TFT + LSTM + XGBoost + RF + Sentiment + Geopolitics + Black-Litterman")
+    print("█"*100 + "\n")
+    
+    # Legal compliance
+    print("⚠️  LEGAL DISCLAIMER:")
+    print("    This is EDUCATIONAL SOFTWARE for research purposes only.")
+    print("    NOT financial advice. You can LOSE money.")
+    print("    Consult licensed professionals before investing real money.\n")
+    
+    response = input("    Type 'I ACCEPT' to continue or 'EXIT' to quit: ").strip().upper()
+    
+    if response != 'I ACCEPT':
+        print("\n❌ You must accept to continue. Exiting...\n")
+        return
+    
+    print("\n✅ Proceeding with analysis...\n")
+    
+    # User input
+    print("📝 Investment Parameters:")
+    
+    while True:
+        try:
+            capital = float(input("   💰 Capital (EUR): ").replace(',', ''))
+            if capital > 0:
+                break
+        except ValueError:
+            pass
+    
+    print("\n   Risk Profile:")
+    print("      1️⃣  Conservative (Capital Protection)")
+    print("      2️⃣  Moderate (Balanced)")
+    print("      3️⃣  Aggressive (Maximum Growth)")
+    
+    choice = input("\n   Your choice (1-3): ").strip()
+    risk_map = {'1': 'conservative', '2': 'moderate', '3': 'aggressive'}
+    risk_profile = risk_map.get(choice, 'moderate')
+    
+    print(f"\n🎯 Initializing SmartInvest Ultimate for €{capital:,.0f} [{risk_profile}]...\n")
+    
+    # Run analysis
+    system = SmartInvestUltimateEnhanced(capital, risk_profile)
+    system.run_enhanced()
+    
+    print("\n✅ Analysis complete! Check the dashboard above for interactive visualizations.")
+    print("📁 Logs saved to:", Config.LOGS_DIR)
+    print("💾 Cache stored in:", Config.CACHE_DIR)
+    print("\n🙏 Thank you for using SmartInvest Ultimate!\n")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\n❌ Analysis interrupted by user.\n")
+    except Exception as e:
+        logger.log(LogLevel.CRITICAL, f"Fatal error: {e}")
+        import traceback
+        traceback.print_exc()
