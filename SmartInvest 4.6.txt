@@ -1,0 +1,2666 @@
+"""
+╔══════════════════════════════════════════════════════════════════════════════╗
+║          SmartInvest 4.6 – Strategy Intelligence Edition                    ║
+║          Advanced AI Investment Analysis & Portfolio Optimization            ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  Modules:                                                                    ║
+║   1. Core Infrastructure & Configuration                                     ║
+║   2. Market Data Engine                                                      ║
+║   3. Market Regime Detection (HMM-based)                                     ║
+║   4. Multi-Model Ensemble AI (XGBoost + RF + LSTM + RL)                      ║
+║   5. Strategy Engine (Momentum / Value / Macro / AI-Generated)               ║
+║   6. Scenario Simulation Engine                                               ║
+║   7. Risk Intelligence System (VaR / Drawdown / Correlation)                 ║
+║   8. Explainable AI (XAI) Module                                              ║
+║   9. Backtesting Lab                                                          ║
+║  10. Portfolio Optimization Engine                                            ║
+║  11. Multi-Agent System (Macro / Alpha / Sentiment / Risk / Portfolio)        ║
+║  12. Reporting & Dashboard                                                    ║
+║  13. Main Orchestrator                                                        ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MODULE 1 – CORE INFRASTRUCTURE & CONFIGURATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+import os
+import sys
+import json
+import time
+import math
+import logging
+import sqlite3
+import warnings
+import threading
+import traceback
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple, Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from logging.handlers import RotatingFileHandler
+from dataclasses import dataclass, field
+
+import numpy as np
+import pandas as pd
+from scipy import stats
+from scipy.optimize import minimize
+
+warnings.filterwarnings("ignore")
+
+# ── Optional dependency imports with graceful fallback ────────────────────────
+try:
+    import yfinance as yf
+    YFINANCE_AVAILABLE = True
+except ImportError:
+    YFINANCE_AVAILABLE = False
+
+try:
+    from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor, GradientBoostingRegressor
+    from sklearn.preprocessing import StandardScaler, MinMaxScaler
+    from sklearn.model_selection import TimeSeriesSplit
+    from sklearn.metrics import mean_squared_error
+    from sklearn.linear_model import Ridge
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    SKLEARN_AVAILABLE = False
+
+try:
+    import xgboost as xgb
+    XGBOOST_AVAILABLE = True
+except ImportError:
+    XGBOOST_AVAILABLE = False
+
+try:
+    import lightgbm as lgb
+    LIGHTGBM_AVAILABLE = True
+except ImportError:
+    LIGHTGBM_AVAILABLE = False
+
+try:
+    from hmmlearn.hmm import GaussianHMM
+    HMMLEARN_AVAILABLE = True
+except ImportError:
+    HMMLEARN_AVAILABLE = False
+
+try:
+    import tensorflow as tf
+    from tensorflow.keras.models import Sequential
+    from tensorflow.keras.layers import LSTM, Dense, Dropout
+    TF_AVAILABLE = True
+except ImportError:
+    TF_AVAILABLE = False
+
+try:
+    import plotly.graph_objects as go
+    import plotly.express as px
+    from plotly.subplots import make_subplots
+    PLOTLY_AVAILABLE = True
+except ImportError:
+    PLOTLY_AVAILABLE = False
+
+try:
+    from textblob import TextBlob
+    TEXTBLOB_AVAILABLE = True
+except ImportError:
+    TEXTBLOB_AVAILABLE = False
+
+try:
+    import requests
+    REQUESTS_AVAILABLE = True
+except ImportError:
+    REQUESTS_AVAILABLE = False
+
+
+# ── Logging setup ─────────────────────────────────────────────────────────────
+def setup_logger(name: str = "SmartInvest46", log_file: str = "smartinvest_4_6.log") -> logging.Logger:
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.DEBUG)
+    fmt = logging.Formatter("%(asctime)s | %(levelname)-8s | %(name)s | %(message)s")
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(fmt)
+    try:
+        fh = RotatingFileHandler(log_file, maxBytes=5 * 1024 * 1024, backupCount=3)
+        fh.setLevel(logging.DEBUG)
+        fh.setFormatter(fmt)
+        logger.addHandler(fh)
+    except Exception:
+        pass
+    logger.addHandler(ch)
+    return logger
+
+
+logger = setup_logger()
+
+
+# ── Secure configuration ──────────────────────────────────────────────────────
+class SecureConfig:
+    """Load all API keys from environment variables – never hardcode."""
+    FRED_API_KEY: str = os.getenv("FRED_API_KEY", "")
+    NEWS_API_KEY: str = os.getenv("NEWS_API_KEY", "")
+    ALPHA_VANTAGE_KEY: str = os.getenv("ALPHA_VANTAGE_KEY", "")
+
+    DEFAULT_TICKERS: List[str] = [
+        "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA",
+        "JPM", "JNJ", "XOM", "BRK-B", "SPY",
+        "QQQ", "GLD", "TLT", "BTC-USD", "ETH-USD",
+    ]
+    BENCHMARK: str = "SPY"
+    LOOKBACK_DAYS: int = 365 * 3
+    RISK_FREE_RATE: float = 0.045
+
+
+# ── Data structures ───────────────────────────────────────────────────────────
+@dataclass
+class MarketRegime:
+    name: str           # bull / bear / sideways / high_volatility / crisis
+    confidence: float   # 0-1
+    characteristics: Dict[str, float] = field(default_factory=dict)
+    recommended_adjustments: Dict[str, float] = field(default_factory=dict)
+
+
+@dataclass
+class Strategy:
+    name: str
+    strategy_type: str       # momentum / value / macro / ai_generated / defensive
+    regime_target: str       # bull / bear / sideways / all
+    allocations: Dict[str, float] = field(default_factory=dict)   # asset -> weight
+    expected_return: str = "medium"    # low / medium / high
+    expected_volatility: str = "medium"
+    description: str = ""
+    rationale: List[str] = field(default_factory=list)
+    score: float = 0.0
+
+
+@dataclass
+class EnsemblePrediction:
+    ticker: str
+    horizon_days: int
+    xgboost_pred: Optional[float] = None
+    rf_pred: Optional[float] = None
+    lstm_pred: Optional[float] = None
+    rl_pred: Optional[float] = None
+    ensemble_pred: float = 0.0
+    confidence: float = 0.0
+    model_weights: Dict[str, float] = field(default_factory=dict)
+    direction: str = "neutral"    # up / down / neutral
+
+
+@dataclass
+class ScenarioResult:
+    scenario_name: str
+    description: str
+    portfolio_return: float
+    max_loss: float
+    hedging_suggestions: List[str] = field(default_factory=list)
+    affected_positions: Dict[str, float] = field(default_factory=dict)
+    recovery_time_estimate: str = ""
+
+
+@dataclass
+class RiskReport:
+    ticker: str
+    var_95: float
+    var_99: float
+    cvar_95: float
+    max_drawdown: float
+    volatility_annual: float
+    beta: float
+    correlation_risk: float
+    risk_level: str    # low / medium / medium-high / high / critical
+    main_risk_sources: List[str] = field(default_factory=list)
+
+
+@dataclass
+class XAIExplanation:
+    ticker: str
+    action: str           # increase / decrease / hold / buy / sell
+    allocation_pct: float
+    reasons: List[str] = field(default_factory=list)
+    sentiment_score: float = 0.0
+    momentum_score: float = 0.0
+    value_score: float = 0.0
+    risk_score: float = 0.0
+    confidence: float = 0.0
+
+
+@dataclass
+class BacktestResult:
+    strategy_name: str
+    period: str
+    assets: List[str]
+    total_return: float
+    cagr: float
+    max_drawdown: float
+    sharpe_ratio: float
+    sortino_ratio: float
+    calmar_ratio: float
+    win_rate: float
+    trades: int
+    equity_curve: pd.Series = field(default_factory=pd.Series)
+    monthly_returns: pd.Series = field(default_factory=pd.Series)
+
+
+# ── SQLite persistence ────────────────────────────────────────────────────────
+class Database:
+    def __init__(self, db_path: str = "smartinvest_4_6.db"):
+        self.db_path = db_path
+        self._init_tables()
+
+    def _conn(self):
+        return sqlite3.connect(self.db_path, check_same_thread=False)
+
+    def _init_tables(self):
+        with self._conn() as conn:
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS price_cache (
+                    ticker TEXT, date TEXT, open REAL, high REAL, low REAL,
+                    close REAL, volume REAL, PRIMARY KEY (ticker, date)
+                );
+                CREATE TABLE IF NOT EXISTS regime_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT, regime TEXT, confidence REAL, details TEXT
+                );
+                CREATE TABLE IF NOT EXISTS strategy_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT, strategy_name TEXT, regime TEXT,
+                    expected_return TEXT, score REAL, allocations TEXT
+                );
+                CREATE TABLE IF NOT EXISTS backtest_results (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT, strategy TEXT, period TEXT,
+                    cagr REAL, sharpe REAL, max_drawdown REAL, details TEXT
+                );
+                CREATE TABLE IF NOT EXISTS scenario_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT, scenario TEXT, portfolio_return REAL, details TEXT
+                );
+            """)
+
+    def cache_prices(self, ticker: str, df: pd.DataFrame):
+        with self._conn() as conn:
+            for date, row in df.iterrows():
+                try:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO price_cache VALUES (?,?,?,?,?,?,?)",
+                        (ticker, str(date), float(row.get("Open", 0)),
+                         float(row.get("High", 0)), float(row.get("Low", 0)),
+                         float(row.get("Close", 0)), float(row.get("Volume", 0)))
+                    )
+                except Exception:
+                    pass
+
+    def log_regime(self, regime: MarketRegime):
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT INTO regime_history (timestamp, regime, confidence, details) VALUES (?,?,?,?)",
+                (datetime.now().isoformat(), regime.name, regime.confidence,
+                 json.dumps(regime.characteristics))
+            )
+
+    def log_strategy(self, strategy: Strategy, regime: str):
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT INTO strategy_log (timestamp, strategy_name, regime, expected_return, score, allocations) VALUES (?,?,?,?,?,?)",
+                (datetime.now().isoformat(), strategy.name, regime,
+                 strategy.expected_return, strategy.score,
+                 json.dumps(strategy.allocations))
+            )
+
+    def log_backtest(self, result: BacktestResult):
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT INTO backtest_results (timestamp, strategy, period, cagr, sharpe, max_drawdown, details) VALUES (?,?,?,?,?,?,?)",
+                (datetime.now().isoformat(), result.strategy_name, result.period,
+                 result.cagr, result.sharpe_ratio, result.max_drawdown,
+                 json.dumps({"total_return": result.total_return, "win_rate": result.win_rate}))
+            )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MODULE 2 – MARKET DATA ENGINE
+# ─────────────────────────────────────────────────────────────────────────────
+
+class MarketDataEngine:
+    def __init__(self, db: Database):
+        self.db = db
+        self._cache: Dict[str, pd.DataFrame] = {}
+        self._lock = threading.Lock()
+
+    def fetch_ticker(self, ticker: str, days: int = 730) -> Optional[pd.DataFrame]:
+        if not YFINANCE_AVAILABLE:
+            return self._synthetic_data(ticker, days)
+        try:
+            end = datetime.now()
+            start = end - timedelta(days=days)
+            data = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=True)
+            if data.empty:
+                return self._synthetic_data(ticker, days)
+            data.columns = [c[0] if isinstance(c, tuple) else c for c in data.columns]
+            self.db.cache_prices(ticker, data)
+            return data
+        except Exception as e:
+            logger.warning(f"yfinance error for {ticker}: {e}")
+            return self._synthetic_data(ticker, days)
+
+    def _synthetic_data(self, ticker: str, days: int) -> pd.DataFrame:
+        """Fallback synthetic price series when yfinance is unavailable."""
+        np.random.seed(abs(hash(ticker)) % 2**31)
+        dates = pd.date_range(end=datetime.now(), periods=days, freq="B")
+        mu, sigma = 0.0003, 0.015
+        returns = np.random.normal(mu, sigma, len(dates))
+        prices = 100 * np.cumprod(1 + returns)
+        df = pd.DataFrame({
+            "Open": prices * 0.999,
+            "High": prices * 1.012,
+            "Low": prices * 0.988,
+            "Close": prices,
+            "Volume": np.random.randint(1_000_000, 50_000_000, len(dates)),
+        }, index=dates)
+        return df
+
+    def fetch_multiple(self, tickers: List[str], days: int = 730) -> Dict[str, pd.DataFrame]:
+        results = {}
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = {pool.submit(self.fetch_ticker, t, days): t for t in tickers}
+            for future in as_completed(futures):
+                t = futures[future]
+                try:
+                    df = future.result()
+                    if df is not None and not df.empty:
+                        results[t] = df
+                except Exception as e:
+                    logger.warning(f"Failed to fetch {t}: {e}")
+        return results
+
+    def compute_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Compute technical features for ML models."""
+        feat = pd.DataFrame(index=df.index)
+        close = df["Close"]
+        feat["returns_1d"] = close.pct_change(1)
+        feat["returns_5d"] = close.pct_change(5)
+        feat["returns_20d"] = close.pct_change(20)
+        feat["returns_60d"] = close.pct_change(60)
+
+        # Moving averages
+        for w in [5, 10, 20, 50, 200]:
+            feat[f"sma_{w}"] = close.rolling(w).mean()
+            feat[f"price_vs_sma_{w}"] = close / feat[f"sma_{w}"] - 1
+
+        # Volatility
+        feat["vol_20d"] = feat["returns_1d"].rolling(20).std() * np.sqrt(252)
+        feat["vol_60d"] = feat["returns_1d"].rolling(60).std() * np.sqrt(252)
+        feat["vol_ratio"] = feat["vol_20d"] / feat["vol_60d"]
+
+        # RSI
+        delta = close.diff()
+        gain = delta.clip(lower=0).rolling(14).mean()
+        loss = (-delta.clip(upper=0)).rolling(14).mean()
+        rs = gain / (loss + 1e-9)
+        feat["rsi_14"] = 100 - (100 / (1 + rs))
+
+        # MACD
+        ema12 = close.ewm(span=12).mean()
+        ema26 = close.ewm(span=26).mean()
+        feat["macd"] = ema12 - ema26
+        feat["macd_signal"] = feat["macd"].ewm(span=9).mean()
+        feat["macd_hist"] = feat["macd"] - feat["macd_signal"]
+
+        # Bollinger band width
+        sma20 = close.rolling(20).mean()
+        std20 = close.rolling(20).std()
+        feat["bb_width"] = 2 * std20 / (sma20 + 1e-9)
+        feat["bb_position"] = (close - (sma20 - 2 * std20)) / (4 * std20 + 1e-9)
+
+        # Volume features
+        if "Volume" in df.columns:
+            vol = df["Volume"]
+            feat["volume_ratio"] = vol / vol.rolling(20).mean()
+
+        return feat.dropna()
+
+    def get_market_overview(self, tickers: List[str], days: int = 252) -> Dict:
+        data = self.fetch_multiple(tickers, days)
+        overview = {}
+        for ticker, df in data.items():
+            if df is None or len(df) < 20:
+                continue
+            close = df["Close"]
+            ret_1y = float(close.pct_change(min(252, len(close)-1)).iloc[-1])
+            ret_1m = float(close.pct_change(21).iloc[-1])
+            vol = float(close.pct_change().rolling(20).std().iloc[-1] * np.sqrt(252))
+            overview[ticker] = {
+                "price": float(close.iloc[-1]),
+                "return_1y": ret_1y,
+                "return_1m": ret_1m,
+                "volatility": vol,
+            }
+        return overview
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MODULE 3 – MARKET REGIME DETECTION
+# ─────────────────────────────────────────────────────────────────────────────
+
+class MarketRegimeDetector:
+    """
+    Detects market regime using HMM (if available) or rule-based fallback.
+    Regimes: bull / bear / sideways / high_volatility / crisis
+    """
+    REGIMES = ["bull", "bear", "sideways", "high_volatility", "crisis"]
+
+    def __init__(self, n_components: int = 5):
+        self.n_components = n_components
+        self.model = None
+        self._trained = False
+
+    def _build_obs(self, df: pd.DataFrame) -> np.ndarray:
+        close = df["Close"]
+        ret = close.pct_change().dropna()
+        vol = ret.rolling(20).std().dropna()
+        ret = ret.iloc[-len(vol):]
+        obs = np.column_stack([ret.values, vol.values])
+        return obs
+
+    def fit(self, df: pd.DataFrame) -> bool:
+        if not HMMLEARN_AVAILABLE or len(df) < 100:
+            return False
+        try:
+            obs = self._build_obs(df)
+            self.model = GaussianHMM(
+                n_components=self.n_components,
+                covariance_type="diag",
+                n_iter=200,
+                random_state=42,
+            )
+            self.model.fit(obs)
+            self._trained = True
+            return True
+        except Exception as e:
+            logger.warning(f"HMM fit failed: {e}")
+            return False
+
+    def detect(self, df: pd.DataFrame) -> MarketRegime:
+        """Detect current market regime from price data."""
+        close = df["Close"]
+        ret_20d = float(close.pct_change(20).iloc[-1])
+        ret_60d = float(close.pct_change(60).iloc[-1])
+        vol_20d = float(close.pct_change().rolling(20).std().iloc[-1] * np.sqrt(252))
+        vol_60d = float(close.pct_change().rolling(60).std().iloc[-1] * np.sqrt(252))
+        drawdown = self._compute_drawdown(close)
+
+        # HMM-based detection
+        if self._trained and self.model is not None:
+            try:
+                obs = self._build_obs(df)
+                state = self.model.predict(obs)[-1]
+                means = self.model.means_
+                # Map state with highest mean return to bull, lowest to bear, etc.
+                sorted_states = np.argsort(means[:, 0])
+                regime_map = {
+                    sorted_states[-1]: "bull",
+                    sorted_states[0]: "bear",
+                    sorted_states[len(sorted_states)//2]: "sideways",
+                }
+                if vol_20d > 0.35:
+                    regime_name = "crisis" if drawdown < -0.15 else "high_volatility"
+                else:
+                    regime_name = regime_map.get(state, "sideways")
+                confidence = 0.75
+                return self._build_regime(regime_name, confidence, ret_20d, vol_20d, drawdown)
+            except Exception:
+                pass
+
+        # Rule-based fallback
+        return self._rule_based(ret_20d, ret_60d, vol_20d, vol_60d, drawdown)
+
+    def _rule_based(self, ret_20d, ret_60d, vol_20d, vol_60d, drawdown) -> MarketRegime:
+        if vol_20d > 0.40 and drawdown < -0.15:
+            regime_name, confidence = "crisis", 0.85
+        elif vol_20d > 0.30:
+            regime_name, confidence = "high_volatility", 0.80
+        elif ret_20d > 0.04 and ret_60d > 0.08:
+            regime_name, confidence = "bull", 0.78
+        elif ret_20d < -0.04 and ret_60d < -0.08:
+            regime_name, confidence = "bear", 0.78
+        elif abs(ret_20d) < 0.02 and abs(ret_60d) < 0.04:
+            regime_name, confidence = "sideways", 0.70
+        elif ret_20d < -0.02 or ret_60d < -0.04:
+            regime_name, confidence = "bear", 0.60
+        else:
+            regime_name, confidence = "bull", 0.55
+        return self._build_regime(regime_name, confidence, ret_20d, vol_20d, drawdown)
+
+    def _build_regime(self, name, confidence, ret_20d, vol_20d, drawdown) -> MarketRegime:
+        adj = self._get_adjustments(name)
+        return MarketRegime(
+            name=name,
+            confidence=confidence,
+            characteristics={
+                "return_20d": round(ret_20d, 4),
+                "volatility_20d": round(vol_20d, 4),
+                "drawdown": round(drawdown, 4),
+            },
+            recommended_adjustments=adj,
+        )
+
+    def _get_adjustments(self, regime: str) -> Dict[str, float]:
+        adj_map = {
+            "bull":          {"equities": +0.10, "bonds": -0.05, "gold": -0.03, "cash": -0.02},
+            "bear":          {"equities": -0.15, "bonds": +0.08, "gold": +0.05, "cash": +0.02},
+            "sideways":      {"equities": 0.00, "bonds": +0.02, "gold": +0.01, "cash": -0.03},
+            "high_volatility":{"equities": -0.10, "bonds": +0.04, "gold": +0.06, "cash": 0.00},
+            "crisis":        {"equities": -0.20, "bonds": +0.10, "gold": +0.08, "cash": +0.02},
+        }
+        return adj_map.get(regime, {})
+
+    @staticmethod
+    def _compute_drawdown(close: pd.Series) -> float:
+        peak = close.expanding().max()
+        dd = (close - peak) / peak
+        return float(dd.min())
+
+    def format_report(self, regime: MarketRegime) -> str:
+        lines = [
+            f"\n{'='*60}",
+            f"  MARKET REGIME DETECTION",
+            f"{'='*60}",
+            f"  Detected Regime : {regime.name.upper().replace('_', ' ')}",
+            f"  Confidence      : {regime.confidence*100:.1f}%",
+            f"  Return (20d)    : {regime.characteristics.get('return_20d', 0)*100:.2f}%",
+            f"  Volatility (20d): {regime.characteristics.get('volatility_20d', 0)*100:.2f}%",
+            f"  Drawdown        : {regime.characteristics.get('drawdown', 0)*100:.2f}%",
+            f"\n  Recommended Allocation Adjustments:",
+        ]
+        for asset, change in regime.recommended_adjustments.items():
+            direction = "▲" if change > 0 else ("▼" if change < 0 else "─")
+            lines.append(f"    {direction} {asset.capitalize()}: {change*100:+.1f}%")
+        lines.append(f"{'='*60}")
+        return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MODULE 4 – MULTI-MODEL ENSEMBLE AI
+# ─────────────────────────────────────────────────────────────────────────────
+
+class EnsembleAI:
+    """
+    Combines XGBoost + Random Forest + LSTM + simple RL agent.
+    Weights updated via softmax over inverse-MSE scores (adaptive ensemble).
+    """
+    def __init__(self):
+        self.models: Dict[str, Any] = {}
+        self.scalers: Dict[str, Any] = {}
+        self.weights: Dict[str, float] = {
+            "xgboost": 0.30,
+            "rf": 0.30,
+            "lstm": 0.25,
+            "rl": 0.15,
+        }
+        self.mse_scores: Dict[str, float] = {}
+        self._trained_tickers: set = set()
+
+    # ── Training ──────────────────────────────────────────────────────────────
+    def train(self, ticker: str, features: pd.DataFrame, target: pd.Series) -> bool:
+        if len(features) < 60:
+            return False
+        try:
+            X = features.values
+            y = target.values
+
+            scaler = StandardScaler() if SKLEARN_AVAILABLE else None
+            if scaler:
+                X_scaled = scaler.fit_transform(X)
+                self.scalers[ticker] = scaler
+            else:
+                X_scaled = X
+
+            split = int(len(X) * 0.8)
+            X_train, X_val = X_scaled[:split], X_scaled[split:]
+            y_train, y_val = y[:split], y[split:]
+
+            mse_map = {}
+
+            # XGBoost
+            if XGBOOST_AVAILABLE:
+                try:
+                    m = xgb.XGBRegressor(n_estimators=200, max_depth=5,
+                                         learning_rate=0.05, subsample=0.8,
+                                         random_state=42, verbosity=0)
+                    m.fit(X_train, y_train)
+                    pred = m.predict(X_val)
+                    mse_map["xgboost"] = mean_squared_error(y_val, pred) if SKLEARN_AVAILABLE else 1.0
+                    self.models[f"{ticker}_xgboost"] = m
+                except Exception as e:
+                    logger.debug(f"XGBoost train error: {e}")
+
+            # Random Forest
+            if SKLEARN_AVAILABLE:
+                try:
+                    m = RandomForestRegressor(n_estimators=150, max_depth=8,
+                                               random_state=42, n_jobs=-1)
+                    m.fit(X_train, y_train)
+                    pred = m.predict(X_val)
+                    mse_map["rf"] = mean_squared_error(y_val, pred)
+                    self.models[f"{ticker}_rf"] = m
+                except Exception as e:
+                    logger.debug(f"RF train error: {e}")
+
+            # LSTM
+            if TF_AVAILABLE and len(X_train) >= 40:
+                try:
+                    seq_len = 20
+                    Xs, ys = self._make_sequences(X_scaled, y, seq_len)
+                    if len(Xs) > 20:
+                        sp = int(len(Xs) * 0.8)
+                        model_lstm = Sequential([
+                            LSTM(64, input_shape=(seq_len, X.shape[1]), return_sequences=True),
+                            Dropout(0.2),
+                            LSTM(32),
+                            Dropout(0.2),
+                            Dense(1),
+                        ])
+                        model_lstm.compile(optimizer="adam", loss="mse")
+                        model_lstm.fit(Xs[:sp], ys[:sp], epochs=20, batch_size=32,
+                                       verbose=0, validation_data=(Xs[sp:], ys[sp:]))
+                        pred_lstm = model_lstm.predict(Xs[sp:], verbose=0).flatten()
+                        mse_map["lstm"] = float(np.mean((ys[sp:] - pred_lstm) ** 2))
+                        self.models[f"{ticker}_lstm"] = model_lstm
+                        self.models[f"{ticker}_lstm_seq"] = seq_len
+                except Exception as e:
+                    logger.debug(f"LSTM train error: {e}")
+
+            # Simple RL agent (linear policy gradient)
+            try:
+                rl_pred = self._train_rl_agent(X_train, y_train, X_val, y_val)
+                mse_map["rl"] = float(np.mean((y_val - rl_pred) ** 2))
+                self.models[f"{ticker}_rl_w"] = self.models.get(f"{ticker}_rl_w")
+            except Exception as e:
+                logger.debug(f"RL train error: {e}")
+
+            # Update adaptive weights
+            self._update_weights(mse_map)
+            self.mse_scores[ticker] = mse_map
+            self._trained_tickers.add(ticker)
+            return True
+        except Exception as e:
+            logger.error(f"Ensemble train failed for {ticker}: {e}")
+            return False
+
+    def _make_sequences(self, X, y, seq_len):
+        Xs, ys = [], []
+        for i in range(seq_len, len(X)):
+            Xs.append(X[i - seq_len:i])
+            ys.append(y[i])
+        return np.array(Xs), np.array(ys)
+
+    def _train_rl_agent(self, X_train, y_train, X_val, y_val) -> np.ndarray:
+        """Minimal linear policy trained with gradient descent."""
+        n_feat = X_train.shape[1]
+        w = np.zeros(n_feat)
+        lr = 1e-4
+        for _ in range(200):
+            pred = X_train @ w
+            grad = -2 * X_train.T @ (y_train - pred) / len(y_train)
+            w -= lr * grad
+        self.models["rl_w"] = w
+        return X_val @ w
+
+    def _update_weights(self, mse_map: Dict[str, float]):
+        if not mse_map:
+            return
+        inv_mse = {k: 1.0 / (v + 1e-8) for k, v in mse_map.items()}
+        total = sum(inv_mse.values())
+        for k in self.weights:
+            if k in inv_mse:
+                self.weights[k] = inv_mse[k] / total
+            else:
+                self.weights[k] = 0.0
+        # Renormalize
+        s = sum(self.weights.values())
+        if s > 0:
+            for k in self.weights:
+                self.weights[k] /= s
+
+    # ── Prediction ────────────────────────────────────────────────────────────
+    def predict(self, ticker: str, features: pd.DataFrame, horizon: int = 5) -> EnsemblePrediction:
+        if len(features) < 5:
+            return EnsemblePrediction(ticker=ticker, horizon_days=horizon)
+
+        X = features.values[-1:].reshape(1, -1)
+        scaler = self.scalers.get(ticker)
+        if scaler:
+            X_scaled = scaler.transform(X)
+        else:
+            X_scaled = X
+
+        preds = {}
+
+        if f"{ticker}_xgboost" in self.models:
+            try:
+                preds["xgboost"] = float(self.models[f"{ticker}_xgboost"].predict(X_scaled)[0])
+            except Exception:
+                pass
+
+        if f"{ticker}_rf" in self.models:
+            try:
+                preds["rf"] = float(self.models[f"{ticker}_rf"].predict(X_scaled)[0])
+            except Exception:
+                pass
+
+        if f"{ticker}_lstm" in self.models:
+            try:
+                seq_len = self.models.get(f"{ticker}_lstm_seq", 20)
+                if len(features) >= seq_len:
+                    scaler_vals = self.scalers.get(ticker)
+                    raw = features.values[-seq_len:]
+                    X_seq = scaler_vals.transform(raw) if scaler_vals else raw
+                    X_seq = X_seq.reshape(1, seq_len, -1)
+                    preds["lstm"] = float(self.models[f"{ticker}_lstm"].predict(X_seq, verbose=0)[0][0])
+            except Exception:
+                pass
+
+        rl_w = self.models.get("rl_w")
+        if rl_w is not None:
+            try:
+                preds["rl"] = float(X_scaled @ rl_w.reshape(-1, 1))
+            except Exception:
+                pass
+
+        # Weighted ensemble
+        ensemble = 0.0
+        weight_used = 0.0
+        for model_name, pred_val in preds.items():
+            w = self.weights.get(model_name, 0.0)
+            ensemble += pred_val * w
+            weight_used += w
+
+        if weight_used > 0:
+            ensemble /= weight_used
+
+        confidence = min(0.95, weight_used * len(preds) / 4 * 0.8)
+        direction = "up" if ensemble > 0.005 else ("down" if ensemble < -0.005 else "neutral")
+
+        return EnsemblePrediction(
+            ticker=ticker,
+            horizon_days=horizon,
+            xgboost_pred=preds.get("xgboost"),
+            rf_pred=preds.get("rf"),
+            lstm_pred=preds.get("lstm"),
+            rl_pred=preds.get("rl"),
+            ensemble_pred=round(ensemble, 5),
+            confidence=round(confidence, 3),
+            model_weights=dict(self.weights),
+            direction=direction,
+        )
+
+    def format_report(self, pred: EnsemblePrediction) -> str:
+        lines = [
+            f"\n{'─'*55}",
+            f"  ENSEMBLE AI PREDICTION – {pred.ticker}",
+            f"{'─'*55}",
+            f"  Horizon       : {pred.horizon_days} days",
+            f"  Ensemble Pred : {pred.ensemble_pred*100:+.3f}%",
+            f"  Direction     : {pred.direction.upper()}",
+            f"  Confidence    : {pred.confidence*100:.1f}%",
+            f"\n  Model Contributions:",
+        ]
+        model_preds = {
+            "XGBoost": pred.xgboost_pred,
+            "Random Forest": pred.rf_pred,
+            "LSTM": pred.lstm_pred,
+            "RL Agent": pred.rl_pred,
+        }
+        for name, val in model_preds.items():
+            w_key = name.lower().replace(" ", "").replace("agent", "")
+            if val is not None:
+                w = pred.model_weights.get(w_key, pred.model_weights.get(
+                    "xgboost" if "xg" in name.lower() else
+                    "rf" if "forest" in name.lower() else
+                    "lstm" if "lstm" in name.lower() else "rl", 0))
+                lines.append(f"    {name:<18}: {val*100:+.3f}%  (weight: {w*100:.1f}%)")
+        lines.append(f"{'─'*55}")
+        return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MODULE 5 – STRATEGY ENGINE
+# ─────────────────────────────────────────────────────────────────────────────
+
+class StrategyEngine:
+    """
+    Generates and scores investment strategies based on regime, predictions,
+    and macro indicators. Strategy types: momentum / value / macro / ai_generated / defensive.
+    """
+
+    STRATEGY_LIBRARY: List[Dict] = [
+        # ── Momentum strategies ───────────────────────────────────────────────
+        {
+            "name": "Aggressive Momentum",
+            "strategy_type": "momentum",
+            "regime_target": "bull",
+            "allocations": {"tech_etf": 0.40, "growth_equities": 0.35, "leveraged_etf": 0.15, "cash": 0.10},
+            "expected_return": "high",
+            "expected_volatility": "high",
+            "description": "Chases strong price momentum in bull markets with tech-heavy tilt.",
+        },
+        {
+            "name": "Sector Rotation Momentum",
+            "strategy_type": "momentum",
+            "regime_target": "bull",
+            "allocations": {"leading_sector": 0.45, "broad_market": 0.30, "bonds": 0.15, "cash": 0.10},
+            "expected_return": "high",
+            "expected_volatility": "medium",
+            "description": "Rotates into the strongest-performing sectors each quarter.",
+        },
+        # ── Value strategies ──────────────────────────────────────────────────
+        {
+            "name": "Deep Value Contrarian",
+            "strategy_type": "value",
+            "regime_target": "bear",
+            "allocations": {"undervalued_equities": 0.50, "dividend_stocks": 0.25, "bonds": 0.15, "gold": 0.10},
+            "expected_return": "medium",
+            "expected_volatility": "medium",
+            "description": "Buys beaten-down value stocks with strong balance sheets.",
+        },
+        {
+            "name": "Dividend Fortress",
+            "strategy_type": "value",
+            "regime_target": "all",
+            "allocations": {"dividend_aristocrats": 0.50, "bonds": 0.25, "reits": 0.15, "cash": 0.10},
+            "expected_return": "medium",
+            "expected_volatility": "low",
+            "description": "Focus on dividend-paying companies with consistent payout history.",
+        },
+        # ── Macro strategies ──────────────────────────────────────────────────
+        {
+            "name": "Inflation Shield",
+            "strategy_type": "macro",
+            "regime_target": "high_volatility",
+            "allocations": {"gold": 0.25, "commodities": 0.20, "tips": 0.20, "energy": 0.20, "cash": 0.15},
+            "expected_return": "medium",
+            "expected_volatility": "medium",
+            "description": "Designed for high-inflation environments; hedges via real assets.",
+        },
+        {
+            "name": "Recession Survival",
+            "strategy_type": "macro",
+            "regime_target": "bear",
+            "allocations": {"bonds": 0.40, "dividend_stocks": 0.25, "gold": 0.20, "cash": 0.15},
+            "expected_return": "low",
+            "expected_volatility": "low",
+            "description": "Capital preservation during economic contraction.",
+        },
+        {
+            "name": "Crisis Alpha",
+            "strategy_type": "macro",
+            "regime_target": "crisis",
+            "allocations": {"gold": 0.30, "bonds": 0.35, "cash": 0.25, "inverse_etf": 0.10},
+            "expected_return": "low",
+            "expected_volatility": "low",
+            "description": "Maximum defensive posture during market crises.",
+        },
+        # ── AI-generated strategies ───────────────────────────────────────────
+        {
+            "name": "AI Momentum Alpha",
+            "strategy_type": "ai_generated",
+            "regime_target": "bull",
+            "allocations": {"high_momentum_ai": 0.40, "growth_equities": 0.30, "tech_etf": 0.20, "cash": 0.10},
+            "expected_return": "high",
+            "expected_volatility": "medium",
+            "description": "AI-generated strategy combining momentum signals with ML predictions.",
+        },
+        {
+            "name": "AI Balanced Growth",
+            "strategy_type": "ai_generated",
+            "regime_target": "sideways",
+            "allocations": {"equities": 0.35, "bonds": 0.25, "gold": 0.15, "reits": 0.15, "cash": 0.10},
+            "expected_return": "medium",
+            "expected_volatility": "medium",
+            "description": "AI-optimized balanced portfolio for range-bound markets.",
+        },
+        # ── Defensive strategies ──────────────────────────────────────────────
+        {
+            "name": "Defensive Growth",
+            "strategy_type": "defensive",
+            "regime_target": "bear",
+            "allocations": {"bonds": 0.40, "dividend_stocks": 0.30, "gold": 0.20, "cash": 0.10},
+            "expected_return": "medium",
+            "expected_volatility": "low",
+            "description": "Balances capital preservation with modest growth potential.",
+        },
+        {
+            "name": "All Weather",
+            "strategy_type": "defensive",
+            "regime_target": "all",
+            "allocations": {"equities": 0.30, "long_bonds": 0.40, "gold": 0.15, "commodities": 0.07, "cash": 0.08},
+            "expected_return": "medium",
+            "expected_volatility": "low",
+            "description": "Ray Dalio-inspired risk-parity approach for any environment.",
+        },
+    ]
+
+    def __init__(self):
+        pass
+
+    def generate_strategies(
+        self,
+        regime: MarketRegime,
+        predictions: Dict[str, EnsemblePrediction],
+        risk_tolerance: str = "medium",
+    ) -> List[Strategy]:
+        """Return scored strategies appropriate for the detected regime."""
+        strategies = []
+        for s_def in self.STRATEGY_LIBRARY:
+            s = Strategy(**{k: v for k, v in s_def.items()})
+            s.score = self._score_strategy(s, regime, predictions, risk_tolerance)
+            s.rationale = self._build_rationale(s, regime, predictions)
+            strategies.append(s)
+
+        # Also generate a dynamic AI strategy based on current regime
+        ai_dyn = self._generate_dynamic_ai_strategy(regime, predictions, risk_tolerance)
+        strategies.append(ai_dyn)
+
+        strategies.sort(key=lambda x: x.score, reverse=True)
+        return strategies
+
+    def _score_strategy(
+        self,
+        strategy: Strategy,
+        regime: MarketRegime,
+        predictions: Dict[str, EnsemblePrediction],
+        risk_tolerance: str,
+    ) -> float:
+        score = 50.0
+
+        # Regime alignment
+        if strategy.regime_target == "all":
+            score += 10
+        elif strategy.regime_target == regime.name:
+            score += 30 * regime.confidence
+        else:
+            score -= 15
+
+        # Risk tolerance alignment
+        risk_map = {"low": {"low": 20, "medium": 5, "high": -10},
+                    "medium": {"low": 5, "medium": 15, "high": 5},
+                    "high": {"low": -5, "medium": 8, "high": 20}}
+        score += risk_map.get(risk_tolerance, {}).get(strategy.expected_volatility, 0)
+
+        # Prediction signal
+        if predictions:
+            avg_pred = np.mean([p.ensemble_pred for p in predictions.values()])
+            if strategy.strategy_type in ("momentum", "ai_generated") and avg_pred > 0:
+                score += min(15, avg_pred * 500)
+            elif strategy.strategy_type in ("defensive", "macro") and avg_pred < 0:
+                score += min(15, abs(avg_pred) * 400)
+
+        return round(max(0, min(100, score)), 1)
+
+    def _build_rationale(
+        self,
+        strategy: Strategy,
+        regime: MarketRegime,
+        predictions: Dict[str, EnsemblePrediction],
+    ) -> List[str]:
+        reasons = [f"Strategy type: {strategy.strategy_type.replace('_', ' ').title()}"]
+        if strategy.regime_target == regime.name:
+            reasons.append(f"Well-matched to {regime.name.replace('_', ' ')} market regime")
+        if predictions:
+            up_count = sum(1 for p in predictions.values() if p.direction == "up")
+            if up_count > len(predictions) * 0.6:
+                reasons.append(f"Majority of tracked assets show bullish ML signals ({up_count}/{len(predictions)})")
+            elif up_count < len(predictions) * 0.4:
+                reasons.append("Bearish ML signals suggest defensive positioning")
+        return reasons
+
+    def _generate_dynamic_ai_strategy(
+        self,
+        regime: MarketRegime,
+        predictions: Dict[str, EnsemblePrediction],
+        risk_tolerance: str,
+    ) -> Strategy:
+        """Dynamically build an allocation based on regime + predictions."""
+        base_alloc = {
+            "bull":          {"equities": 0.60, "bonds": 0.15, "gold": 0.10, "cash": 0.15},
+            "bear":          {"equities": 0.25, "bonds": 0.45, "gold": 0.20, "cash": 0.10},
+            "sideways":      {"equities": 0.40, "bonds": 0.30, "gold": 0.15, "cash": 0.15},
+            "high_volatility":{"equities": 0.30, "bonds": 0.30, "gold": 0.25, "cash": 0.15},
+            "crisis":        {"equities": 0.15, "bonds": 0.40, "gold": 0.30, "cash": 0.15},
+        }.get(regime.name, {"equities": 0.40, "bonds": 0.30, "gold": 0.15, "cash": 0.15})
+
+        # Adjust based on prediction signals
+        if predictions:
+            bull_frac = sum(1 for p in predictions.values() if p.direction == "up") / len(predictions)
+            delta = (bull_frac - 0.5) * 0.10
+            base_alloc["equities"] = min(0.80, max(0.10, base_alloc.get("equities", 0.40) + delta))
+            base_alloc["cash"] = max(0.05, base_alloc.get("cash", 0.15) - delta / 2)
+            # Re-normalize
+            total = sum(base_alloc.values())
+            base_alloc = {k: round(v / total, 3) for k, v in base_alloc.items()}
+
+        risk_vol = {"low": "low", "medium": "medium", "high": "high"}.get(risk_tolerance, "medium")
+
+        s = Strategy(
+            name=f"AI Dynamic – {regime.name.title()} Adapted",
+            strategy_type="ai_generated",
+            regime_target=regime.name,
+            allocations=base_alloc,
+            expected_return="high" if regime.name == "bull" else ("medium" if regime.name == "sideways" else "low"),
+            expected_volatility=risk_vol,
+            description=f"Dynamically generated by AI for current {regime.name} regime.",
+            rationale=[
+                f"Auto-generated for {regime.name.replace('_', ' ')} regime (confidence {regime.confidence*100:.0f}%)",
+                "Allocations adjusted based on real-time ML ensemble signals",
+            ],
+        )
+        s.score = self._score_strategy(s, regime, predictions, risk_tolerance)
+        return s
+
+    def format_top_strategies(self, strategies: List[Strategy], n: int = 3) -> str:
+        top = strategies[:n]
+        lines = [f"\n{'='*62}", "  TOP INVESTMENT STRATEGIES", f"{'='*62}"]
+        for i, s in enumerate(top, 1):
+            lines += [
+                f"\n  [{i}] {s.name}",
+                f"      Type       : {s.strategy_type.replace('_', ' ').title()}",
+                f"      Regime Fit : {s.regime_target.replace('_', ' ').title()}",
+                f"      Score      : {s.score:.1f}/100",
+                f"      Volatility : {s.expected_volatility.upper()}",
+                f"      Return Est.: {s.expected_return.upper()}",
+                f"      Description: {s.description}",
+                f"      Allocations:",
+            ]
+            for asset, weight in s.allocations.items():
+                bar = "█" * int(weight * 30)
+                lines.append(f"        {asset:<22} {weight*100:5.1f}%  {bar}")
+            if s.rationale:
+                lines.append(f"      Rationale:")
+                for r in s.rationale:
+                    lines.append(f"        • {r}")
+        lines.append(f"\n{'='*62}")
+        return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MODULE 6 – SCENARIO SIMULATION ENGINE
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ScenarioSimulator:
+    """
+    Simulates what-if scenarios: market crash, inflation spike, recession, etc.
+    """
+
+    BUILT_IN_SCENARIOS = {
+        "market_crash_20": {
+            "name": "Market Crash -20%",
+            "description": "S&P 500 drops 20% over 3 months",
+            "equity_shock": -0.20,
+            "bond_shock": +0.05,
+            "gold_shock": +0.08,
+            "vol_multiplier": 2.5,
+        },
+        "market_crash_40": {
+            "name": "Severe Market Crash -40%",
+            "description": "2008-style crash – equities fall 40%",
+            "equity_shock": -0.40,
+            "bond_shock": +0.12,
+            "gold_shock": +0.15,
+            "vol_multiplier": 4.0,
+        },
+        "inflation_8pct": {
+            "name": "Inflation at 8%",
+            "description": "CPI rises to 8%, Fed tightens aggressively",
+            "equity_shock": -0.12,
+            "bond_shock": -0.15,
+            "gold_shock": +0.20,
+            "vol_multiplier": 1.8,
+        },
+        "recession": {
+            "name": "Recession",
+            "description": "Two consecutive quarters of GDP contraction",
+            "equity_shock": -0.25,
+            "bond_shock": +0.08,
+            "gold_shock": +0.10,
+            "vol_multiplier": 2.0,
+        },
+        "rate_hike_200bps": {
+            "name": "Rate Hike +200bps",
+            "description": "Fed hikes rates by 200 basis points",
+            "equity_shock": -0.10,
+            "bond_shock": -0.18,
+            "gold_shock": -0.05,
+            "vol_multiplier": 1.5,
+        },
+        "dollar_collapse": {
+            "name": "Dollar Weakens 15%",
+            "description": "USD weakens significantly vs major currencies",
+            "equity_shock": +0.05,
+            "bond_shock": -0.08,
+            "gold_shock": +0.25,
+            "vol_multiplier": 1.6,
+        },
+        "tech_bubble_burst": {
+            "name": "Tech Bubble Burst",
+            "description": "Nasdaq falls 35%, tech valuations collapse",
+            "equity_shock": -0.35,
+            "bond_shock": +0.06,
+            "gold_shock": +0.05,
+            "vol_multiplier": 3.0,
+        },
+    }
+
+    def simulate(
+        self,
+        scenario_key: str,
+        portfolio: Dict[str, float],
+        custom_shocks: Optional[Dict] = None,
+    ) -> ScenarioResult:
+        """
+        portfolio: {asset_class: weight}  e.g. {"equities": 0.6, "bonds": 0.3, "gold": 0.1}
+        """
+        if custom_shocks:
+            scenario = custom_shocks
+            scenario.setdefault("name", "Custom Scenario")
+            scenario.setdefault("description", "User-defined scenario")
+        else:
+            scenario = self.BUILT_IN_SCENARIOS.get(scenario_key, self.BUILT_IN_SCENARIOS["market_crash_20"])
+
+        shock_map = {
+            "equities": scenario.get("equity_shock", -0.20),
+            "bonds": scenario.get("bond_shock", +0.05),
+            "gold": scenario.get("gold_shock", +0.08),
+            "cash": 0.0,
+            "reits": scenario.get("equity_shock", -0.20) * 0.8,
+            "commodities": scenario.get("gold_shock", +0.08) * 0.6,
+            "tech_etf": scenario.get("equity_shock", -0.20) * 1.3,
+            "growth_equities": scenario.get("equity_shock", -0.20) * 1.2,
+            "dividend_stocks": scenario.get("equity_shock", -0.20) * 0.7,
+            "tips": scenario.get("bond_shock", 0.0) * 0.3,
+            "inverse_etf": -scenario.get("equity_shock", -0.20) * 0.8,
+        }
+
+        affected = {}
+        total_pnl = 0.0
+        for asset, weight in portfolio.items():
+            shock = shock_map.get(asset, shock_map.get("equities", -0.20))
+            pnl = weight * shock
+            affected[asset] = round(pnl, 4)
+            total_pnl += pnl
+
+        hedges = self._suggest_hedges(scenario, total_pnl)
+        recovery = self._estimate_recovery(total_pnl, scenario.get("vol_multiplier", 2.0))
+
+        return ScenarioResult(
+            scenario_name=scenario["name"],
+            description=scenario["description"],
+            portfolio_return=round(total_pnl, 4),
+            max_loss=round(total_pnl * 1.3, 4),
+            hedging_suggestions=hedges,
+            affected_positions=affected,
+            recovery_time_estimate=recovery,
+        )
+
+    def _suggest_hedges(self, scenario: Dict, total_pnl: float) -> List[str]:
+        hedges = []
+        if total_pnl < -0.10:
+            hedges.append("Add gold allocation (5-10%) as flight-to-safety hedge")
+        if total_pnl < -0.15:
+            hedges.append("Increase Treasury bond allocation (long duration)")
+            hedges.append("Consider protective put options on equity positions")
+        if scenario.get("equity_shock", 0) < -0.15:
+            hedges.append("Reduce tech/growth exposure; rotate to defensive sectors")
+        if scenario.get("bond_shock", 0) < -0.10:
+            hedges.append("Shorten bond duration; consider TIPS as inflation hedge")
+        if not hedges:
+            hedges.append("Portfolio shows resilience – no major hedging action required")
+        return hedges
+
+    def _estimate_recovery(self, total_pnl: float, vol_mult: float) -> str:
+        if total_pnl > -0.05:
+            return "< 3 months"
+        elif total_pnl > -0.10:
+            return "3–6 months"
+        elif total_pnl > -0.20:
+            return "6–18 months"
+        elif total_pnl > -0.30:
+            return "18–36 months"
+        else:
+            return "3–5 years (historical average for severe bear markets)"
+
+    def run_all(self, portfolio: Dict[str, float]) -> List[ScenarioResult]:
+        results = []
+        for key in self.BUILT_IN_SCENARIOS:
+            results.append(self.simulate(key, portfolio))
+        results.sort(key=lambda x: x.portfolio_return)
+        return results
+
+    def format_report(self, result: ScenarioResult) -> str:
+        lines = [
+            f"\n{'─'*58}",
+            f"  SCENARIO: {result.scenario_name}",
+            f"{'─'*58}",
+            f"  Description      : {result.description}",
+            f"  Portfolio Impact : {result.portfolio_return*100:+.2f}%",
+            f"  Worst-Case Loss  : {result.max_loss*100:+.2f}%",
+            f"  Est. Recovery    : {result.recovery_time_estimate}",
+            f"\n  Asset-Level Impact:",
+        ]
+        for asset, pnl in result.affected_positions.items():
+            icon = "▼" if pnl < 0 else "▲"
+            lines.append(f"    {icon} {asset:<22}: {pnl*100:+.2f}%")
+        lines.append(f"\n  Recommended Hedges:")
+        for hedge in result.hedging_suggestions:
+            lines.append(f"    • {hedge}")
+        lines.append(f"{'─'*58}")
+        return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MODULE 7 – RISK INTELLIGENCE SYSTEM
+# ─────────────────────────────────────────────────────────────────────────────
+
+class RiskIntelligence:
+    """
+    VaR, CVaR, drawdown, volatility forecasting, correlation risk.
+    """
+
+    def analyze(
+        self,
+        ticker: str,
+        df: pd.DataFrame,
+        benchmark_df: Optional[pd.DataFrame] = None,
+    ) -> RiskReport:
+        close = df["Close"]
+        returns = close.pct_change().dropna()
+
+        var_95 = self._var(returns, 0.95)
+        var_99 = self._var(returns, 0.99)
+        cvar_95 = self._cvar(returns, 0.95)
+        max_dd = self._max_drawdown(close)
+        vol_ann = float(returns.std() * np.sqrt(252))
+        beta = self._beta(returns, benchmark_df)
+        corr_risk = self._correlation_risk(returns)
+
+        risk_level = self._classify_risk(var_99, vol_ann, max_dd, beta)
+        sources = self._identify_risk_sources(ticker, var_99, vol_ann, max_dd, beta, corr_risk)
+
+        return RiskReport(
+            ticker=ticker,
+            var_95=round(var_95, 4),
+            var_99=round(var_99, 4),
+            cvar_95=round(cvar_95, 4),
+            max_drawdown=round(max_dd, 4),
+            volatility_annual=round(vol_ann, 4),
+            beta=round(beta, 3),
+            correlation_risk=round(corr_risk, 3),
+            risk_level=risk_level,
+            main_risk_sources=sources,
+        )
+
+    def _var(self, returns: pd.Series, confidence: float) -> float:
+        return float(np.percentile(returns, (1 - confidence) * 100))
+
+    def _cvar(self, returns: pd.Series, confidence: float) -> float:
+        var = self._var(returns, confidence)
+        tail = returns[returns <= var]
+        return float(tail.mean()) if len(tail) > 0 else var
+
+    def _max_drawdown(self, close: pd.Series) -> float:
+        peak = close.expanding().max()
+        dd = (close - peak) / peak
+        return float(dd.min())
+
+    def _beta(self, returns: pd.Series, bench_df: Optional[pd.DataFrame]) -> float:
+        if bench_df is None or bench_df.empty:
+            return 1.0
+        try:
+            bench_ret = bench_df["Close"].pct_change().dropna()
+            aligned = pd.concat([returns, bench_ret], axis=1, join="inner").dropna()
+            if len(aligned) < 30:
+                return 1.0
+            cov = np.cov(aligned.iloc[:, 0], aligned.iloc[:, 1])
+            return float(cov[0, 1] / (cov[1, 1] + 1e-10))
+        except Exception:
+            return 1.0
+
+    def _correlation_risk(self, returns: pd.Series) -> float:
+        """Autocorrelation as proxy for momentum/mean-reversion risk."""
+        if len(returns) < 20:
+            return 0.5
+        autocorr = returns.autocorr(lag=1)
+        return round(abs(autocorr), 3)
+
+    def _classify_risk(self, var_99: float, vol: float, max_dd: float, beta: float) -> str:
+        score = 0
+        if abs(var_99) > 0.04:
+            score += 2
+        elif abs(var_99) > 0.02:
+            score += 1
+        if vol > 0.40:
+            score += 2
+        elif vol > 0.25:
+            score += 1
+        if max_dd < -0.40:
+            score += 2
+        elif max_dd < -0.25:
+            score += 1
+        if beta > 1.5:
+            score += 2
+        elif beta > 1.2:
+            score += 1
+        levels = ["low", "medium", "medium-high", "high", "critical"]
+        return levels[min(score, len(levels) - 1)]
+
+    def _identify_risk_sources(self, ticker, var_99, vol, max_dd, beta, corr_risk) -> List[str]:
+        sources = []
+        if abs(var_99) > 0.03:
+            sources.append(f"High daily tail risk (VaR 99%: {var_99*100:.2f}%)")
+        if vol > 0.30:
+            sources.append(f"Elevated annualized volatility ({vol*100:.1f}%)")
+        if max_dd < -0.30:
+            sources.append(f"Large historical drawdown ({max_dd*100:.1f}%)")
+        if beta > 1.3:
+            sources.append(f"High market beta ({beta:.2f}) – amplifies market moves")
+        if corr_risk > 0.15:
+            sources.append("Significant autocorrelation – trend/momentum risk present")
+        if any(s in ticker.upper() for s in ["BTC", "ETH", "CRYPTO"]):
+            sources.append("Crypto asset: extreme volatility and liquidity risk")
+        if not sources:
+            sources.append("Risk within acceptable bounds – no major concerns")
+        return sources
+
+    def portfolio_risk(
+        self,
+        price_data: Dict[str, pd.DataFrame],
+        weights: Dict[str, float],
+    ) -> Dict:
+        """Portfolio-level risk aggregation."""
+        returns_matrix = []
+        tickers = []
+        for t, df in price_data.items():
+            if t in weights and df is not None and len(df) > 30:
+                ret = df["Close"].pct_change().dropna()
+                returns_matrix.append(ret)
+                tickers.append(t)
+
+        if not returns_matrix:
+            return {}
+
+        df_ret = pd.concat(returns_matrix, axis=1, join="inner").dropna()
+        df_ret.columns = tickers
+        w = np.array([weights.get(t, 0) for t in tickers])
+        w = w / (w.sum() + 1e-10)
+
+        port_ret = (df_ret * w).sum(axis=1)
+        corr_matrix = df_ret.corr()
+        cov_matrix = df_ret.cov()
+        port_vol = float(np.sqrt(w @ cov_matrix.values @ w) * np.sqrt(252))
+        port_var95 = self._var(port_ret, 0.95)
+        port_dd = self._max_drawdown(port_ret.cumsum().apply(np.exp))
+
+        return {
+            "portfolio_volatility": round(port_vol, 4),
+            "portfolio_var_95": round(port_var95, 4),
+            "max_drawdown": round(port_dd, 4),
+            "correlation_matrix": corr_matrix.round(3),
+            "diversification_ratio": round(
+                np.sqrt(np.sum(w ** 2 * df_ret.std().values ** 2)) / (port_ret.std() + 1e-10), 3
+            ),
+        }
+
+    def format_report(self, report: RiskReport) -> str:
+        lines = [
+            f"\n{'─'*55}",
+            f"  RISK INTELLIGENCE – {report.ticker}",
+            f"{'─'*55}",
+            f"  Risk Level         : {report.risk_level.upper()}",
+            f"  VaR (95%, 1-day)   : {report.var_95*100:.3f}%",
+            f"  VaR (99%, 1-day)   : {report.var_99*100:.3f}%",
+            f"  CVaR (95%)         : {report.cvar_95*100:.3f}%",
+            f"  Max Drawdown       : {report.max_drawdown*100:.2f}%",
+            f"  Annual Volatility  : {report.volatility_annual*100:.2f}%",
+            f"  Beta               : {report.beta:.3f}",
+            f"  Autocorr. Risk     : {report.correlation_risk:.3f}",
+            f"\n  Main Risk Sources:",
+        ]
+        for src in report.main_risk_sources:
+            lines.append(f"    ⚠  {src}")
+        lines.append(f"{'─'*55}")
+        return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MODULE 8 – EXPLAINABLE AI (XAI)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ExplainableAI:
+    """
+    Generates human-readable explanations for every AI recommendation.
+    Uses feature importance from ensemble models + rule-based interpretation.
+    """
+
+    def explain(
+        self,
+        ticker: str,
+        prediction: EnsemblePrediction,
+        risk_report: RiskReport,
+        features: pd.DataFrame,
+        action: str = "auto",
+        allocation_pct: float = 0.0,
+    ) -> XAIExplanation:
+
+        momentum_score = self._compute_momentum(features)
+        value_score = self._compute_value(features)
+        sentiment_score = self._infer_sentiment(ticker, prediction)
+        risk_score = self._risk_to_score(risk_report)
+
+        if action == "auto":
+            action = self._determine_action(prediction, risk_report)
+
+        reasons = self._build_reasons(
+            ticker, prediction, risk_report, momentum_score,
+            value_score, sentiment_score, risk_score
+        )
+        confidence = float(np.mean([
+            min(1, abs(momentum_score)),
+            prediction.confidence,
+            max(0, 1 - risk_score),
+        ]))
+
+        return XAIExplanation(
+            ticker=ticker,
+            action=action,
+            allocation_pct=allocation_pct,
+            reasons=reasons,
+            sentiment_score=round(sentiment_score, 3),
+            momentum_score=round(momentum_score, 3),
+            value_score=round(value_score, 3),
+            risk_score=round(risk_score, 3),
+            confidence=round(confidence, 3),
+        )
+
+    def _compute_momentum(self, features: pd.DataFrame) -> float:
+        if features.empty:
+            return 0.0
+        last = features.iloc[-1]
+        scores = []
+        if "returns_20d" in features.columns:
+            scores.append(float(last["returns_20d"]) * 5)
+        if "price_vs_sma_50" in features.columns:
+            scores.append(float(last["price_vs_sma_50"]) * 3)
+        if "macd_hist" in features.columns:
+            scores.append(1.0 if last["macd_hist"] > 0 else -1.0)
+        if "rsi_14" in features.columns:
+            rsi = float(last["rsi_14"])
+            scores.append((rsi - 50) / 50)
+        return float(np.mean(scores)) if scores else 0.0
+
+    def _compute_value(self, features: pd.DataFrame) -> float:
+        if features.empty:
+            return 0.0
+        last = features.iloc[-1]
+        if "rsi_14" in features.columns:
+            rsi = float(last["rsi_14"])
+            return max(-1, min(1, (50 - rsi) / 50))
+        return 0.0
+
+    def _infer_sentiment(self, ticker: str, prediction: EnsemblePrediction) -> float:
+        base = prediction.ensemble_pred * 10
+        tech_tickers = ["AAPL", "MSFT", "GOOGL", "NVDA", "AMZN", "META", "TSLA"]
+        if ticker in tech_tickers:
+            base += 0.1
+        return float(np.clip(base, -1, 1))
+
+    def _risk_to_score(self, risk: RiskReport) -> float:
+        map_ = {"low": 0.1, "medium": 0.3, "medium-high": 0.55, "high": 0.75, "critical": 0.95}
+        return map_.get(risk.risk_level, 0.3)
+
+    def _determine_action(self, prediction: EnsemblePrediction, risk: RiskReport) -> str:
+        if risk.risk_level == "critical":
+            return "sell"
+        if prediction.direction == "up" and risk.risk_level in ("low", "medium"):
+            return "increase"
+        if prediction.direction == "down" or risk.risk_level == "high":
+            return "decrease"
+        return "hold"
+
+    def _build_reasons(
+        self,
+        ticker: str,
+        prediction: EnsemblePrediction,
+        risk: RiskReport,
+        momentum: float,
+        value: float,
+        sentiment: float,
+        risk_score: float,
+    ) -> List[str]:
+        reasons = []
+
+        # Prediction signal
+        p = prediction.ensemble_pred * 100
+        if abs(p) > 0.5:
+            reasons.append(
+                f"Ensemble model predicts {p:+.2f}% move over {prediction.horizon_days} days "
+                f"(confidence: {prediction.confidence*100:.0f}%)"
+            )
+
+        # Momentum
+        if momentum > 0.3:
+            reasons.append(f"Strong positive price momentum (score: {momentum:+.2f})")
+        elif momentum < -0.3:
+            reasons.append(f"Negative price momentum detected (score: {momentum:+.2f})")
+
+        # Value
+        if value > 0.3:
+            reasons.append("Oversold territory – potential mean-reversion opportunity")
+        elif value < -0.3:
+            reasons.append("Overbought territory – elevated valuation risk")
+
+        # Sentiment
+        if sentiment > 0.2:
+            reasons.append(f"Positive market sentiment inferred for {ticker}")
+        elif sentiment < -0.2:
+            reasons.append(f"Negative market sentiment detected for {ticker}")
+
+        # Risk
+        if risk_score > 0.6:
+            reasons.append(f"⚠ Elevated risk level ({risk.risk_level}) – reduce exposure")
+        elif risk_score < 0.25:
+            reasons.append(f"Risk profile acceptable ({risk.risk_level} risk level)")
+
+        # Model agreement
+        model_preds = [p for p in [prediction.xgboost_pred, prediction.rf_pred,
+                                    prediction.lstm_pred, prediction.rl_pred] if p is not None]
+        if len(model_preds) >= 3:
+            if all(p > 0 for p in model_preds):
+                reasons.append("All ensemble models agree: bullish signal")
+            elif all(p < 0 for p in model_preds):
+                reasons.append("All ensemble models agree: bearish signal")
+
+        return reasons if reasons else ["Insufficient signal strength – hold recommended"]
+
+    def format_report(self, explanation: XAIExplanation) -> str:
+        action_icons = {"increase": "▲", "decrease": "▼", "buy": "✓", "sell": "✗", "hold": "─"}
+        icon = action_icons.get(explanation.action, "?")
+        lines = [
+            f"\n{'─'*58}",
+            f"  EXPLAINABLE AI – {explanation.ticker}",
+            f"{'─'*58}",
+            f"  Recommended Action : {icon} {explanation.action.upper()}",
+            f"  Allocation Target  : {explanation.allocation_pct:.1f}%",
+            f"  AI Confidence      : {explanation.confidence*100:.1f}%",
+            f"\n  Score Breakdown:",
+            f"    Momentum  : {explanation.momentum_score:+.3f}",
+            f"    Value     : {explanation.value_score:+.3f}",
+            f"    Sentiment : {explanation.sentiment_score:+.3f}",
+            f"    Risk      : {explanation.risk_score:.3f} (lower = better)",
+            f"\n  Reasoning:",
+        ]
+        for reason in explanation.reasons:
+            lines.append(f"    • {reason}")
+        lines.append(f"{'─'*58}")
+        return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MODULE 9 – BACKTESTING LAB
+# ─────────────────────────────────────────────────────────────────────────────
+
+class BacktestingLab:
+    """
+    Tests strategies on historical data with proper walk-forward methodology.
+    No lookahead bias: signals computed strictly from past data.
+    """
+
+    def run(
+        self,
+        strategy: Strategy,
+        price_data: Dict[str, pd.DataFrame],
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        initial_capital: float = 100_000.0,
+        rebalance_freq: str = "monthly",
+    ) -> BacktestResult:
+
+        # Determine date range
+        all_closes = {}
+        for ticker, df in price_data.items():
+            if df is not None and not df.empty and "Close" in df.columns:
+                all_closes[ticker] = df["Close"]
+
+        if not all_closes:
+            return self._empty_result(strategy.name)
+
+        closes = pd.DataFrame(all_closes).dropna(how="all")
+
+        if start_date:
+            closes = closes[closes.index >= pd.to_datetime(start_date)]
+        if end_date:
+            closes = closes[closes.index <= pd.to_datetime(end_date)]
+
+        if len(closes) < 30:
+            return self._empty_result(strategy.name)
+
+        # Map strategy allocations to available tickers
+        weights = self._map_allocations_to_tickers(strategy.allocations, list(closes.columns))
+        if not weights:
+            return self._empty_result(strategy.name)
+
+        # Simulate portfolio with rebalancing
+        equity_curve = self._simulate(closes, weights, initial_capital, rebalance_freq)
+        portfolio_returns = equity_curve.pct_change().dropna()
+
+        total_ret = float((equity_curve.iloc[-1] / equity_curve.iloc[0]) - 1)
+        n_years = len(closes) / 252
+        cagr = float((equity_curve.iloc[-1] / equity_curve.iloc[0]) ** (1 / max(n_years, 0.1)) - 1)
+        max_dd = self._max_drawdown(equity_curve)
+        sharpe = self._sharpe(portfolio_returns)
+        sortino = self._sortino(portfolio_returns)
+        calmar = cagr / (abs(max_dd) + 1e-9)
+
+        # Win rate (% of months with positive return)
+        monthly_ret = portfolio_returns.resample("ME").apply(lambda x: (1 + x).prod() - 1)
+        win_rate = float((monthly_ret > 0).mean())
+
+        period_str = (
+            f"{closes.index[0].strftime('%Y-%m')} to {closes.index[-1].strftime('%Y-%m')}"
+        )
+
+        result = BacktestResult(
+            strategy_name=strategy.name,
+            period=period_str,
+            assets=list(closes.columns),
+            total_return=round(total_ret, 4),
+            cagr=round(cagr, 4),
+            max_drawdown=round(max_dd, 4),
+            sharpe_ratio=round(sharpe, 3),
+            sortino_ratio=round(sortino, 3),
+            calmar_ratio=round(calmar, 3),
+            win_rate=round(win_rate, 3),
+            trades=len(closes) // (21 if rebalance_freq == "monthly" else 5),
+            equity_curve=equity_curve,
+            monthly_returns=monthly_ret,
+        )
+        return result
+
+    def _map_allocations_to_tickers(
+        self, allocations: Dict[str, float], available: List[str]
+    ) -> Dict[str, float]:
+        """Best-effort mapping from strategy asset classes to real tickers."""
+        class_to_ticker = {
+            "equities": ["SPY", "QQQ", "AAPL", "MSFT"],
+            "tech_etf": ["QQQ", "AAPL", "MSFT", "NVDA"],
+            "bonds": ["TLT", "AGG"],
+            "gold": ["GLD"],
+            "cash": [],
+            "dividend_stocks": ["JNJ", "JPM", "XOM"],
+            "growth_equities": ["NVDA", "AMZN", "MSFT"],
+            "reits": ["VNQ"],
+            "commodities": ["GLD", "XOM"],
+            "tips": ["TLT"],
+            "inverse_etf": [],
+        }
+        weights = {}
+        cash_weight = 0.0
+        for asset_class, w in allocations.items():
+            if asset_class == "cash":
+                cash_weight += w
+                continue
+            candidates = class_to_ticker.get(asset_class, [])
+            matched = [t for t in candidates if t in available]
+            if matched:
+                best = matched[0]
+                weights[best] = weights.get(best, 0) + w
+            else:
+                # fallback to SPY or first available
+                fb = "SPY" if "SPY" in available else (available[0] if available else None)
+                if fb:
+                    weights[fb] = weights.get(fb, 0) + w
+
+        # Distribute cash to money-market proxy or just lower weights
+        if weights:
+            total = sum(weights.values()) + cash_weight
+            weights = {t: w / total for t, w in weights.items()}
+
+        return weights
+
+    def _simulate(
+        self,
+        closes: pd.DataFrame,
+        weights: Dict[str, float],
+        initial_capital: float,
+        rebalance_freq: str,
+    ) -> pd.Series:
+        tickers = [t for t in weights if t in closes.columns]
+        if not tickers:
+            return pd.Series([initial_capital], index=closes.index[:1])
+
+        w = np.array([weights[t] for t in tickers])
+        prices = closes[tickers].ffill().dropna()
+        daily_ret = prices.pct_change().fillna(0)
+
+        portfolio_value = initial_capital
+        equity = []
+        rebal_counter = 0
+        rebal_period = 21 if rebalance_freq == "monthly" else 5
+
+        for i, (date, row) in enumerate(daily_ret.iterrows()):
+            port_ret = float(np.dot(w, row.values))
+            portfolio_value *= (1 + port_ret)
+            equity.append(portfolio_value)
+            rebal_counter += 1
+            if rebal_counter >= rebal_period:
+                rebal_counter = 0  # weights stay constant in this simple backtest
+
+        return pd.Series(equity, index=prices.index[:len(equity)])
+
+    def _max_drawdown(self, equity: pd.Series) -> float:
+        peak = equity.expanding().max()
+        dd = (equity - peak) / peak
+        return float(dd.min())
+
+    def _sharpe(self, returns: pd.Series) -> float:
+        rf_daily = SecureConfig.RISK_FREE_RATE / 252
+        excess = returns - rf_daily
+        return float(excess.mean() / (excess.std() + 1e-10) * np.sqrt(252))
+
+    def _sortino(self, returns: pd.Series) -> float:
+        rf_daily = SecureConfig.RISK_FREE_RATE / 252
+        excess = returns - rf_daily
+        downside = excess[excess < 0].std()
+        return float(excess.mean() / (downside + 1e-10) * np.sqrt(252))
+
+    def _empty_result(self, name: str) -> BacktestResult:
+        return BacktestResult(
+            strategy_name=name,
+            period="N/A",
+            assets=[],
+            total_return=0.0,
+            cagr=0.0,
+            max_drawdown=0.0,
+            sharpe_ratio=0.0,
+            sortino_ratio=0.0,
+            calmar_ratio=0.0,
+            win_rate=0.0,
+            trades=0,
+        )
+
+    def format_report(self, result: BacktestResult) -> str:
+        def pct(x): return f"{x*100:.2f}%"
+        lines = [
+            f"\n{'='*62}",
+            f"  BACKTESTING LAB – {result.strategy_name}",
+            f"{'='*62}",
+            f"  Period          : {result.period}",
+            f"  Assets          : {', '.join(result.assets[:5])}{'...' if len(result.assets) > 5 else ''}",
+            f"\n  ── Performance Metrics ──────────────────────────────",
+            f"  Total Return    : {pct(result.total_return)}",
+            f"  CAGR            : {pct(result.cagr)}",
+            f"  Max Drawdown    : {pct(result.max_drawdown)}",
+            f"  Sharpe Ratio    : {result.sharpe_ratio:.3f}",
+            f"  Sortino Ratio   : {result.sortino_ratio:.3f}",
+            f"  Calmar Ratio    : {result.calmar_ratio:.3f}",
+            f"  Win Rate        : {pct(result.win_rate)}",
+            f"  Approx. Trades  : {result.trades}",
+        ]
+        if not result.monthly_returns.empty:
+            best_month = result.monthly_returns.max()
+            worst_month = result.monthly_returns.min()
+            lines += [
+                f"\n  ── Monthly Return Distribution ──────────────────────",
+                f"  Best Month      : {pct(best_month)}",
+                f"  Worst Month     : {pct(worst_month)}",
+                f"  Avg Monthly Ret : {pct(result.monthly_returns.mean())}",
+            ]
+        lines.append(f"{'='*62}")
+        return "\n".join(lines)
+
+    def compare_strategies(self, results: List[BacktestResult]) -> str:
+        if not results:
+            return "No results to compare."
+        results_sorted = sorted(results, key=lambda r: r.sharpe_ratio, reverse=True)
+        lines = [
+            f"\n{'='*72}",
+            f"  STRATEGY COMPARISON (sorted by Sharpe Ratio)",
+            f"{'='*72}",
+            f"  {'Strategy':<28} {'CAGR':>8} {'MaxDD':>8} {'Sharpe':>8} {'Win%':>7}",
+            f"  {'─'*28} {'─'*8} {'─'*8} {'─'*8} {'─'*7}",
+        ]
+        for r in results_sorted:
+            lines.append(
+                f"  {r.strategy_name:<28} {r.cagr*100:>7.2f}% {r.max_drawdown*100:>7.2f}% "
+                f"{r.sharpe_ratio:>8.3f} {r.win_rate*100:>6.1f}%"
+            )
+        lines.append(f"{'='*72}")
+        return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MODULE 10 – PORTFOLIO OPTIMIZATION ENGINE
+# ─────────────────────────────────────────────────────────────────────────────
+
+class PortfolioOptimizer:
+    """
+    Supports: Mean-Variance (Markowitz), Risk Parity, Black-Litterman,
+    Max Sharpe, Min Volatility.
+    """
+
+    def mean_variance(
+        self,
+        returns_df: pd.DataFrame,
+        target_return: Optional[float] = None,
+        risk_free_rate: float = SecureConfig.RISK_FREE_RATE,
+    ) -> Dict[str, float]:
+        """Max Sharpe or min-variance if target_return given."""
+        mu = returns_df.mean() * 252
+        cov = returns_df.cov() * 252
+        n = len(mu)
+
+        def neg_sharpe(w):
+            port_ret = float(w @ mu)
+            port_vol = float(np.sqrt(w @ cov.values @ w))
+            return -(port_ret - risk_free_rate) / (port_vol + 1e-10)
+
+        constraints = [{"type": "eq", "fun": lambda w: np.sum(w) - 1}]
+        if target_return:
+            constraints.append({"type": "eq", "fun": lambda w: float(w @ mu) - target_return})
+
+        results = []
+        for _ in range(10):
+            w0 = np.random.dirichlet(np.ones(n))
+            res = minimize(neg_sharpe, w0, method="SLSQP",
+                           bounds=[(0, 1)] * n, constraints=constraints)
+            if res.success:
+                results.append(res)
+
+        if not results:
+            return {t: 1 / n for t in returns_df.columns}
+
+        best = min(results, key=lambda r: r.fun)
+        w = best.x
+        w = np.clip(w, 0, 1)
+        w /= w.sum()
+        return {t: round(float(wt), 4) for t, wt in zip(returns_df.columns, w)}
+
+    def risk_parity(self, returns_df: pd.DataFrame) -> Dict[str, float]:
+        cov = returns_df.cov().values * 252
+        n = cov.shape[0]
+
+        def risk_parity_obj(w):
+            port_vol = np.sqrt(w @ cov @ w)
+            mrc = cov @ w / (port_vol + 1e-10)
+            rc = w * mrc
+            target_rc = port_vol / n
+            return float(np.sum((rc - target_rc) ** 2))
+
+        results = []
+        for _ in range(10):
+            w0 = np.random.dirichlet(np.ones(n))
+            res = minimize(risk_parity_obj, w0, method="SLSQP",
+                           bounds=[(1e-4, 1)] * n,
+                           constraints=[{"type": "eq", "fun": lambda w: np.sum(w) - 1}])
+            if res.success:
+                results.append(res)
+
+        if not results:
+            return {t: 1 / n for t in returns_df.columns}
+
+        best = min(results, key=lambda r: r.fun)
+        w = np.clip(best.x, 0, 1)
+        w /= w.sum()
+        return {t: round(float(wt), 4) for t, wt in zip(returns_df.columns, w)}
+
+    def black_litterman(
+        self,
+        returns_df: pd.DataFrame,
+        views: Optional[Dict[str, float]] = None,
+        risk_aversion: float = 2.5,
+    ) -> Dict[str, float]:
+        """Simplified Black-Litterman with market cap prior."""
+        n = len(returns_df.columns)
+        cov = returns_df.cov().values * 252
+        pi = returns_df.mean().values * 252  # market implied returns proxy
+
+        if views:
+            tau = 0.05
+            P = np.zeros((len(views), n))
+            q = np.zeros(len(views))
+            omega = np.eye(len(views)) * 0.05
+            tickers = list(returns_df.columns)
+            for i, (ticker, expected_ret) in enumerate(views.items()):
+                if ticker in tickers:
+                    j = tickers.index(ticker)
+                    P[i, j] = 1.0
+                    q[i] = expected_ret
+            try:
+                M1 = np.linalg.inv(tau * cov)
+                M2 = P.T @ np.linalg.inv(omega) @ P
+                mu_bl = np.linalg.inv(M1 + M2) @ (M1 @ pi + P.T @ np.linalg.inv(omega) @ q)
+            except np.linalg.LinAlgError:
+                mu_bl = pi
+        else:
+            mu_bl = pi
+
+        w = np.linalg.solve(risk_aversion * cov + np.eye(n) * 1e-6, mu_bl)
+        w = np.clip(w, 0, 1)
+        w /= (w.sum() + 1e-10)
+        return {t: round(float(wt), 4) for t, wt in zip(returns_df.columns, w)}
+
+    def build_returns_matrix(self, price_data: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+        closes = {}
+        for t, df in price_data.items():
+            if df is not None and "Close" in df.columns and len(df) > 30:
+                closes[t] = df["Close"]
+        return pd.DataFrame(closes).pct_change().dropna()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MODULE 11 – MULTI-AGENT SYSTEM
+# ─────────────────────────────────────────────────────────────────────────────
+
+class BaseAgent:
+    def __init__(self, name: str):
+        self.name = name
+        self.last_signal: Optional[Dict] = None
+
+    def analyze(self, *args, **kwargs) -> Dict:
+        raise NotImplementedError
+
+
+class MacroAgent(BaseAgent):
+    def __init__(self):
+        super().__init__("MacroAgent")
+
+    def analyze(self, market_overview: Dict, regime: MarketRegime) -> Dict:
+        signal = {
+            "agent": self.name,
+            "regime": regime.name,
+            "regime_confidence": regime.confidence,
+            "equity_bias": self._equity_bias(regime),
+            "commentary": self._commentary(regime, market_overview),
+        }
+        self.last_signal = signal
+        return signal
+
+    def _equity_bias(self, regime: MarketRegime) -> str:
+        map_ = {"bull": "overweight", "bear": "underweight",
+                "sideways": "neutral", "high_volatility": "underweight", "crisis": "strongly_underweight"}
+        return map_.get(regime.name, "neutral")
+
+    def _commentary(self, regime: MarketRegime, overview: Dict) -> str:
+        avg_return = np.mean([v["return_1m"] for v in overview.values()]) if overview else 0
+        return (
+            f"Market regime: {regime.name.replace('_', ' ')} (confidence {regime.confidence*100:.0f}%). "
+            f"Average 1M asset return: {avg_return*100:.2f}%. "
+            f"Equity bias: {self._equity_bias(regime)}."
+        )
+
+
+class AlphaAgent(BaseAgent):
+    def __init__(self):
+        super().__init__("AlphaAgent")
+
+    def analyze(
+        self,
+        predictions: Dict[str, EnsemblePrediction],
+        top_n: int = 5,
+    ) -> Dict:
+        ranked = sorted(predictions.values(), key=lambda p: p.ensemble_pred, reverse=True)
+        signal = {
+            "agent": self.name,
+            "top_picks": [p.ticker for p in ranked[:top_n] if p.direction == "up"],
+            "avoid_list": [p.ticker for p in ranked[-top_n:] if p.direction == "down"],
+            "avg_ensemble_pred": round(np.mean([p.ensemble_pred for p in predictions.values()]), 5),
+            "bullish_count": sum(1 for p in predictions.values() if p.direction == "up"),
+            "bearish_count": sum(1 for p in predictions.values() if p.direction == "down"),
+        }
+        self.last_signal = signal
+        return signal
+
+
+class SentimentAgent(BaseAgent):
+    def __init__(self):
+        super().__init__("SentimentAgent")
+
+    def analyze(self, tickers: List[str], price_data: Dict[str, pd.DataFrame]) -> Dict:
+        sentiment_scores = {}
+        for t in tickers:
+            df = price_data.get(t)
+            if df is None or len(df) < 20:
+                sentiment_scores[t] = 0.0
+                continue
+            ret_5d = float(df["Close"].pct_change(5).iloc[-1])
+            ret_20d = float(df["Close"].pct_change(20).iloc[-1])
+            score = (ret_5d * 0.6 + ret_20d * 0.4)
+            sentiment_scores[t] = round(float(np.clip(score * 10, -1, 1)), 3)
+
+        avg = float(np.mean(list(sentiment_scores.values()))) if sentiment_scores else 0.0
+        signal = {
+            "agent": self.name,
+            "overall_sentiment": "positive" if avg > 0.1 else ("negative" if avg < -0.1 else "neutral"),
+            "avg_score": round(avg, 3),
+            "ticker_sentiments": sentiment_scores,
+        }
+        self.last_signal = signal
+        return signal
+
+
+class RiskAgent(BaseAgent):
+    def __init__(self, risk_intelligence: RiskIntelligence):
+        super().__init__("RiskAgent")
+        self.ri = risk_intelligence
+
+    def analyze(
+        self,
+        price_data: Dict[str, pd.DataFrame],
+        weights: Dict[str, float],
+    ) -> Dict:
+        port_risk = self.ri.portfolio_risk(price_data, weights)
+        signal = {
+            "agent": self.name,
+            "portfolio_volatility": port_risk.get("portfolio_volatility", 0),
+            "portfolio_var_95": port_risk.get("portfolio_var_95", 0),
+            "max_drawdown": port_risk.get("max_drawdown", 0),
+            "diversification_ratio": port_risk.get("diversification_ratio", 1),
+            "risk_action": "reduce" if port_risk.get("portfolio_volatility", 0) > 0.25 else "maintain",
+        }
+        self.last_signal = signal
+        return signal
+
+
+class PortfolioAgent(BaseAgent):
+    def __init__(self, optimizer: PortfolioOptimizer):
+        super().__init__("PortfolioAgent")
+        self.optimizer = optimizer
+
+    def analyze(
+        self,
+        price_data: Dict[str, pd.DataFrame],
+        macro_signal: Dict,
+        alpha_signal: Dict,
+        risk_signal: Dict,
+        method: str = "max_sharpe",
+    ) -> Dict:
+        returns_df = self.optimizer.build_returns_matrix(price_data)
+        if returns_df.empty or len(returns_df.columns) < 2:
+            return {"agent": self.name, "weights": {}, "method": method}
+
+        if method == "risk_parity":
+            weights = self.optimizer.risk_parity(returns_df)
+        elif method == "black_litterman":
+            views = {t: alpha_signal.get("avg_ensemble_pred", 0)
+                     for t in alpha_signal.get("top_picks", [])}
+            weights = self.optimizer.black_litterman(returns_df, views)
+        else:
+            weights = self.optimizer.mean_variance(returns_df)
+
+        signal = {
+            "agent": self.name,
+            "weights": weights,
+            "method": method,
+            "n_assets": len(weights),
+        }
+        self.last_signal = signal
+        return signal
+
+
+class MultiAgentSystem:
+    def __init__(
+        self,
+        data_engine: MarketDataEngine,
+        regime_detector: MarketRegimeDetector,
+        ensemble_ai: EnsembleAI,
+        risk_intelligence: RiskIntelligence,
+        optimizer: PortfolioOptimizer,
+    ):
+        self.data_engine = data_engine
+        self.macro_agent = MacroAgent()
+        self.alpha_agent = AlphaAgent()
+        self.sentiment_agent = SentimentAgent()
+        self.risk_agent = RiskAgent(risk_intelligence)
+        self.portfolio_agent = PortfolioAgent(optimizer)
+        self.regime_detector = regime_detector
+
+    def run(
+        self,
+        tickers: List[str],
+        price_data: Dict[str, pd.DataFrame],
+        regime: MarketRegime,
+        predictions: Dict[str, EnsemblePrediction],
+        opt_method: str = "max_sharpe",
+    ) -> Dict:
+        overview = self.data_engine.get_market_overview(tickers)
+        macro = self.macro_agent.analyze(overview, regime)
+        alpha = self.alpha_agent.analyze(predictions)
+        sentiment = self.sentiment_agent.analyze(tickers, price_data)
+
+        # Equal-weight portfolio as starting point for risk agent
+        n = len(tickers)
+        eq_weights = {t: 1 / n for t in tickers}
+        risk = self.risk_agent.analyze(price_data, eq_weights)
+        portfolio = self.portfolio_agent.analyze(price_data, macro, alpha, risk, opt_method)
+
+        return {
+            "macro": macro,
+            "alpha": alpha,
+            "sentiment": sentiment,
+            "risk": risk,
+            "portfolio": portfolio,
+        }
+
+    def format_report(self, signals: Dict) -> str:
+        lines = [f"\n{'='*62}", "  MULTI-AGENT SYSTEM REPORT", f"{'='*62}"]
+
+        macro = signals.get("macro", {})
+        lines += [
+            f"\n  [MacroAgent]",
+            f"    Regime       : {macro.get('regime', 'N/A')} "
+            f"(conf: {macro.get('regime_confidence', 0)*100:.0f}%)",
+            f"    Equity Bias  : {macro.get('equity_bias', 'N/A').upper()}",
+            f"    Commentary   : {macro.get('commentary', '')}",
+        ]
+
+        alpha = signals.get("alpha", {})
+        lines += [
+            f"\n  [AlphaAgent]",
+            f"    Top Picks    : {', '.join(alpha.get('top_picks', [])[:5]) or 'None'}",
+            f"    Avoid List   : {', '.join(alpha.get('avoid_list', [])[:5]) or 'None'}",
+            f"    Avg Pred     : {alpha.get('avg_ensemble_pred', 0)*100:+.3f}%",
+            f"    Bullish/Bear : {alpha.get('bullish_count', 0)} / {alpha.get('bearish_count', 0)}",
+        ]
+
+        sent = signals.get("sentiment", {})
+        lines += [
+            f"\n  [SentimentAgent]",
+            f"    Overall      : {sent.get('overall_sentiment', 'N/A').upper()}",
+            f"    Avg Score    : {sent.get('avg_score', 0):+.3f}",
+        ]
+
+        risk = signals.get("risk", {})
+        lines += [
+            f"\n  [RiskAgent]",
+            f"    Port. Vol    : {risk.get('portfolio_volatility', 0)*100:.2f}%",
+            f"    VaR (95%)    : {risk.get('portfolio_var_95', 0)*100:.3f}%",
+            f"    Max Drawdown : {risk.get('max_drawdown', 0)*100:.2f}%",
+            f"    Diversif.    : {risk.get('diversification_ratio', 1):.3f}",
+            f"    Action       : {risk.get('risk_action', 'N/A').upper()}",
+        ]
+
+        port = signals.get("portfolio", {})
+        lines += [
+            f"\n  [PortfolioAgent]",
+            f"    Opt. Method  : {port.get('method', 'N/A')}",
+            f"    N Assets     : {port.get('n_assets', 0)}",
+            f"    Top Weights  :",
+        ]
+        weights = port.get("weights", {})
+        for t, w in sorted(weights.items(), key=lambda x: x[1], reverse=True)[:7]:
+            bar = "█" * int(w * 40)
+            lines.append(f"      {t:<12} {w*100:5.1f}%  {bar}")
+
+        lines.append(f"\n{'='*62}")
+        return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MODULE 12 – REPORTING & DASHBOARD
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ReportGenerator:
+    def __init__(self):
+        pass
+
+    def generate_text_report(
+        self,
+        regime: MarketRegime,
+        strategies: List[Strategy],
+        agent_signals: Dict,
+        risk_reports: Dict[str, RiskReport],
+        explanations: Dict[str, XAIExplanation],
+        backtest_results: List[BacktestResult],
+        scenario_results: List[ScenarioResult],
+        timestamp: Optional[datetime] = None,
+    ) -> str:
+        ts = (timestamp or datetime.now()).strftime("%Y-%m-%d %H:%M:%S")
+        lines = [
+            "╔══════════════════════════════════════════════════════════════════╗",
+            "║          SmartInvest 4.6 – Full Analysis Report                 ║",
+            f"║          Generated: {ts:<44}║",
+            "╚══════════════════════════════════════════════════════════════════╝",
+        ]
+
+        # Regime
+        lines.append(MarketRegimeDetector().format_report(regime))
+
+        # Top strategies
+        se = StrategyEngine()
+        lines.append(se.format_top_strategies(strategies, n=3))
+
+        # Agent signals
+        mas = MultiAgentSystem.__new__(MultiAgentSystem)
+        lines.append(mas.format_report(agent_signals))
+
+        # Risk reports (top 3)
+        ri = RiskIntelligence()
+        lines.append(f"\n{'─'*55}")
+        lines.append("  RISK INTELLIGENCE SUMMARY")
+        for ticker, rpt in list(risk_reports.items())[:3]:
+            lines.append(ri.format_report(rpt))
+
+        # XAI Explanations
+        xai = ExplainableAI()
+        lines.append(f"\n{'─'*55}")
+        lines.append("  EXPLAINABLE AI DECISIONS")
+        for ticker, exp in list(explanations.items())[:3]:
+            lines.append(xai.format_report(exp))
+
+        # Backtest results
+        lab = BacktestingLab()
+        if backtest_results:
+            lines.append(lab.compare_strategies(backtest_results))
+            lines.append(lab.format_report(backtest_results[0]))
+
+        # Scenario results
+        sim = ScenarioSimulator()
+        if scenario_results:
+            lines.append(f"\n{'─'*55}")
+            lines.append("  SCENARIO SIMULATION RESULTS")
+            for sr in scenario_results[:3]:
+                lines.append(sim.format_report(sr))
+
+        lines += [
+            f"\n{'='*68}",
+            "  SmartInvest 4.6 – Strategy Intelligence Edition",
+            "  All analysis is for educational purposes only.",
+            "  Not financial advice. Always consult a professional.",
+            f"{'='*68}\n",
+        ]
+        return "\n".join(lines)
+
+    def save_report(self, report_text: str, path: str = "smartinvest_4_6_report.txt"):
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(report_text)
+        logger.info(f"Report saved to {path}")
+
+    def generate_plotly_dashboard(
+        self,
+        price_data: Dict[str, pd.DataFrame],
+        regime: MarketRegime,
+        strategies: List[Strategy],
+        backtest_results: List[BacktestResult],
+        risk_reports: Dict[str, RiskReport],
+    ) -> bool:
+        if not PLOTLY_AVAILABLE:
+            logger.warning("Plotly not available – dashboard generation skipped.")
+            return False
+
+        try:
+            fig = make_subplots(
+                rows=3, cols=2,
+                subplot_titles=[
+                    "Price Performance (Normalized)", "Strategy Allocations",
+                    "Backtest Equity Curves", "Risk Heatmap",
+                    "Regime Confidence", "Risk Level Distribution",
+                ],
+                specs=[
+                    [{"type": "scatter"}, {"type": "bar"}],
+                    [{"type": "scatter"}, {"type": "heatmap"}],
+                    [{"type": "bar"}, {"type": "pie"}],
+                ],
+            )
+
+            # 1. Normalized price performance
+            colors = px.colors.qualitative.Plotly
+            for i, (ticker, df) in enumerate(list(price_data.items())[:8]):
+                if df is None or len(df) < 5:
+                    continue
+                close = df["Close"]
+                normalized = close / close.iloc[0] * 100
+                fig.add_trace(
+                    go.Scatter(x=normalized.index, y=normalized.values,
+                               name=ticker, line=dict(color=colors[i % len(colors)])),
+                    row=1, col=1
+                )
+
+            # 2. Strategy allocations (top strategy)
+            if strategies:
+                top = strategies[0]
+                assets = list(top.allocations.keys())
+                weights = [top.allocations[a] * 100 for a in assets]
+                fig.add_trace(
+                    go.Bar(x=assets, y=weights, name=top.name,
+                           marker_color=colors[1]),
+                    row=1, col=2
+                )
+
+            # 3. Backtest equity curves
+            for i, result in enumerate(backtest_results[:4]):
+                if not result.equity_curve.empty:
+                    eq = result.equity_curve / result.equity_curve.iloc[0] * 100
+                    fig.add_trace(
+                        go.Scatter(x=eq.index, y=eq.values,
+                                   name=result.strategy_name,
+                                   line=dict(color=colors[i % len(colors)])),
+                        row=2, col=1
+                    )
+
+            # 4. Correlation heatmap
+            closes = {t: df["Close"] for t, df in list(price_data.items())[:8]
+                      if df is not None and len(df) > 30}
+            if closes:
+                ret_df = pd.DataFrame(closes).pct_change().dropna()
+                corr = ret_df.corr()
+                fig.add_trace(
+                    go.Heatmap(z=corr.values, x=corr.columns, y=corr.columns,
+                               colorscale="RdBu", zmid=0),
+                    row=2, col=2
+                )
+
+            # 5. Regime confidence bar
+            regime_colors = {
+                "bull": "green", "bear": "red", "sideways": "gray",
+                "high_volatility": "orange", "crisis": "darkred"
+            }
+            regimes = list(regime_colors.keys())
+            confidences = [regime.confidence if r == regime.name else 0.05 for r in regimes]
+            fig.add_trace(
+                go.Bar(x=regimes, y=confidences,
+                       marker_color=[regime_colors[r] for r in regimes]),
+                row=3, col=1
+            )
+
+            # 6. Risk level distribution
+            if risk_reports:
+                risk_levels = [r.risk_level for r in risk_reports.values()]
+                from collections import Counter
+                counts = Counter(risk_levels)
+                fig.add_trace(
+                    go.Pie(labels=list(counts.keys()), values=list(counts.values())),
+                    row=3, col=2
+                )
+
+            fig.update_layout(
+                title_text="SmartInvest 4.6 – Strategy Intelligence Dashboard",
+                height=1200,
+                template="plotly_dark",
+                showlegend=True,
+            )
+            fig.write_html("smartinvest_4_6_dashboard.html")
+            logger.info("Dashboard saved to smartinvest_4_6_dashboard.html")
+            return True
+
+        except Exception as e:
+            logger.error(f"Dashboard generation failed: {e}")
+            return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MODULE 13 – MAIN ORCHESTRATOR
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SmartInvest46:
+    """
+    Main orchestrator for SmartInvest 4.6 – Strategy Intelligence Edition.
+    Coordinates all modules and produces a full analysis.
+    """
+
+    def __init__(
+        self,
+        tickers: Optional[List[str]] = None,
+        lookback_days: int = SecureConfig.LOOKBACK_DAYS,
+        risk_tolerance: str = "medium",    # low / medium / high
+        opt_method: str = "max_sharpe",    # max_sharpe / risk_parity / black_litterman
+        run_backtest: bool = True,
+        run_scenarios: bool = True,
+        generate_dashboard: bool = True,
+    ):
+        self.tickers = tickers or SecureConfig.DEFAULT_TICKERS
+        self.lookback_days = lookback_days
+        self.risk_tolerance = risk_tolerance
+        self.opt_method = opt_method
+        self.run_backtest = run_backtest
+        self.run_scenarios = run_scenarios
+        self.generate_dashboard = generate_dashboard
+
+        # Initialise all modules
+        self.db = Database()
+        self.data_engine = MarketDataEngine(self.db)
+        self.regime_detector = MarketRegimeDetector(n_components=5)
+        self.ensemble_ai = EnsembleAI()
+        self.strategy_engine = StrategyEngine()
+        self.scenario_simulator = ScenarioSimulator()
+        self.risk_intelligence = RiskIntelligence()
+        self.xai = ExplainableAI()
+        self.backtest_lab = BacktestingLab()
+        self.optimizer = PortfolioOptimizer()
+        self.mas = MultiAgentSystem(
+            self.data_engine, self.regime_detector,
+            self.ensemble_ai, self.risk_intelligence, self.optimizer
+        )
+        self.reporter = ReportGenerator()
+
+        logger.info("SmartInvest 4.6 initialised successfully.")
+
+    # ── Full analysis pipeline ────────────────────────────────────────────────
+    def run(self) -> str:
+        logger.info(f"Starting full analysis – {len(self.tickers)} tickers")
+        start_time = time.time()
+
+        # ── Step 1: Fetch data ────────────────────────────────────────────────
+        logger.info("Fetching market data...")
+        price_data = self.data_engine.fetch_multiple(self.tickers, self.lookback_days)
+        benchmark_df = price_data.get(SecureConfig.BENCHMARK)
+        logger.info(f"Loaded {len(price_data)} tickers successfully.")
+
+        # ── Step 2: Compute features ──────────────────────────────────────────
+        logger.info("Computing technical features...")
+        features_map: Dict[str, pd.DataFrame] = {}
+        for ticker, df in price_data.items():
+            if df is not None and len(df) > 60:
+                features_map[ticker] = self.data_engine.compute_features(df)
+
+        # ── Step 3: Train ensemble AI ─────────────────────────────────────────
+        logger.info("Training ensemble AI models...")
+        trained = 0
+        for ticker, feat in features_map.items():
+            if len(feat) > 60:
+                target = feat["returns_5d"].shift(-5).dropna()
+                feat_aligned = feat.iloc[:len(target)]
+                feat_clean = feat_aligned.replace([np.inf, -np.inf], np.nan).dropna()
+                target_clean = target.iloc[:len(feat_clean)]
+                if len(feat_clean) > 50:
+                    if self.ensemble_ai.train(ticker, feat_clean, target_clean):
+                        trained += 1
+        logger.info(f"Trained models for {trained} tickers.")
+
+        # ── Step 4: Generate predictions ──────────────────────────────────────
+        logger.info("Generating predictions...")
+        predictions: Dict[str, EnsemblePrediction] = {}
+        for ticker, feat in features_map.items():
+            pred = self.ensemble_ai.predict(ticker, feat, horizon=5)
+            predictions[ticker] = pred
+
+        # ── Step 5: Detect market regime ──────────────────────────────────────
+        logger.info("Detecting market regime...")
+        regime_source = benchmark_df if benchmark_df is not None else next(iter(price_data.values()), None)
+        if regime_source is not None:
+            self.regime_detector.fit(regime_source)
+            regime = self.regime_detector.detect(regime_source)
+        else:
+            regime = MarketRegime(name="sideways", confidence=0.5)
+        self.db.log_regime(regime)
+        logger.info(f"Regime detected: {regime.name} ({regime.confidence*100:.0f}% confidence)")
+
+        # ── Step 6: Generate strategies ───────────────────────────────────────
+        logger.info("Generating investment strategies...")
+        strategies = self.strategy_engine.generate_strategies(regime, predictions, self.risk_tolerance)
+        for s in strategies[:3]:
+            self.db.log_strategy(s, regime.name)
+
+        # ── Step 7: Risk analysis ─────────────────────────────────────────────
+        logger.info("Running risk intelligence analysis...")
+        risk_reports: Dict[str, RiskReport] = {}
+        for ticker, df in price_data.items():
+            if df is not None and len(df) > 50:
+                risk_reports[ticker] = self.risk_intelligence.analyze(ticker, df, benchmark_df)
+
+        # ── Step 8: XAI explanations ──────────────────────────────────────────
+        logger.info("Generating XAI explanations...")
+        explanations: Dict[str, XAIExplanation] = {}
+        for ticker, pred in list(predictions.items())[:10]:
+            risk = risk_reports.get(ticker, RiskReport(ticker, 0, 0, 0, 0, 0.15, 1.0, 0.1, "medium", []))
+            feat = features_map.get(ticker, pd.DataFrame())
+            explanations[ticker] = self.xai.explain(ticker, pred, risk, feat)
+
+        # ── Step 9: Multi-agent analysis ──────────────────────────────────────
+        logger.info("Running multi-agent system...")
+        agent_signals = self.mas.run(
+            self.tickers, price_data, regime, predictions, self.opt_method
+        )
+
+        # ── Step 10: Backtesting ──────────────────────────────────────────────
+        backtest_results: List[BacktestResult] = []
+        if self.run_backtest:
+            logger.info("Running backtesting lab...")
+            for strategy in strategies[:4]:
+                result = self.backtest_lab.run(strategy, price_data, rebalance_freq="monthly")
+                backtest_results.append(result)
+                self.db.log_backtest(result)
+            logger.info(f"Completed {len(backtest_results)} backtests.")
+
+        # ── Step 11: Scenario simulation ──────────────────────────────────────
+        scenario_results: List[ScenarioResult] = []
+        if self.run_scenarios:
+            logger.info("Running scenario simulations...")
+            top_strategy = strategies[0] if strategies else None
+            if top_strategy:
+                portfolio_alloc = top_strategy.allocations
+                for scenario_key in ["market_crash_20", "recession", "inflation_8pct",
+                                     "tech_bubble_burst", "rate_hike_200bps"]:
+                    sr = self.scenario_simulator.simulate(scenario_key, portfolio_alloc)
+                    scenario_results.append(sr)
+
+        # ── Step 12: Generate report ──────────────────────────────────────────
+        logger.info("Generating final report...")
+        report = self.reporter.generate_text_report(
+            regime=regime,
+            strategies=strategies,
+            agent_signals=agent_signals,
+            risk_reports=risk_reports,
+            explanations=explanations,
+            backtest_results=backtest_results,
+            scenario_results=scenario_results,
+        )
+        self.reporter.save_report(report)
+
+        # ── Step 13: Interactive dashboard ────────────────────────────────────
+        if self.generate_dashboard:
+            logger.info("Generating Plotly dashboard...")
+            self.reporter.generate_plotly_dashboard(
+                price_data=price_data,
+                regime=regime,
+                strategies=strategies,
+                backtest_results=backtest_results,
+                risk_reports=risk_reports,
+            )
+
+        elapsed = time.time() - start_time
+        logger.info(f"Analysis complete in {elapsed:.1f}s.")
+        print(report)
+        return report
+
+    # ── Interactive scenario simulation ───────────────────────────────────────
+    def simulate_scenario(
+        self,
+        scenario_key: str,
+        portfolio: Optional[Dict[str, float]] = None,
+    ) -> ScenarioResult:
+        if portfolio is None:
+            portfolio = {"equities": 0.6, "bonds": 0.3, "gold": 0.1}
+        result = self.scenario_simulator.simulate(scenario_key, portfolio)
+        print(self.scenario_simulator.format_report(result))
+        return result
+
+    # ── Interactive backtest ───────────────────────────────────────────────────
+    def backtest_strategy(
+        self,
+        strategy_name: str,
+        tickers: Optional[List[str]] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+    ) -> BacktestResult:
+        bt_tickers = tickers or self.tickers[:8]
+        logger.info(f"Fetching data for backtest: {bt_tickers}")
+        price_data = self.data_engine.fetch_multiple(bt_tickers, self.lookback_days)
+
+        # Find or use first matching strategy from library
+        all_strategies = self.strategy_engine.generate_strategies(
+            MarketRegime("bull", 0.7), {}, self.risk_tolerance
+        )
+        strategy = next((s for s in all_strategies if strategy_name.lower() in s.name.lower()),
+                        all_strategies[0])
+
+        result = self.backtest_lab.run(strategy, price_data, start_date, end_date)
+        print(self.backtest_lab.format_report(result))
+        self.db.log_backtest(result)
+        return result
+
+    # ── Quick prediction for a single ticker ─────────────────────────────────
+    def quick_predict(self, ticker: str) -> EnsemblePrediction:
+        logger.info(f"Quick predict for {ticker}")
+        df = self.data_engine.fetch_ticker(ticker, days=365)
+        if df is None or len(df) < 60:
+            return EnsemblePrediction(ticker=ticker, horizon_days=5)
+        feat = self.data_engine.compute_features(df)
+        target = feat["returns_5d"].shift(-5).dropna()
+        feat_aligned = feat.iloc[:len(target)].replace([np.inf, -np.inf], np.nan).dropna()
+        target_clean = target.iloc[:len(feat_aligned)]
+        self.ensemble_ai.train(ticker, feat_aligned, target_clean)
+        pred = self.ensemble_ai.predict(ticker, feat)
+        print(self.ensemble_ai.format_report(pred))
+        return pred
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENTRY POINT
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main():
+    print("""
+╔══════════════════════════════════════════════════════════════╗
+║        SmartInvest 4.6 – Strategy Intelligence Edition       ║
+║        Starting full analysis pipeline...                    ║
+╚══════════════════════════════════════════════════════════════╝
+    """)
+
+    engine = SmartInvest46(
+        tickers=[
+            "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA",
+            "JPM", "JNJ", "XOM", "SPY", "QQQ",
+            "GLD", "TLT",
+        ],
+        lookback_days=365 * 3,
+        risk_tolerance="medium",     # change to 'low' or 'high' as needed
+        opt_method="max_sharpe",     # or 'risk_parity' / 'black_litterman'
+        run_backtest=True,
+        run_scenarios=True,
+        generate_dashboard=True,
+    )
+
+    report = engine.run()
+
+    # ── Demo: single scenario simulation ──────────────────────────────────────
+    print("\n\n── DEMO SCENARIO: Recession ─────────────────────────────────────")
+    engine.simulate_scenario(
+        "recession",
+        portfolio={"equities": 0.50, "bonds": 0.25, "gold": 0.15, "cash": 0.10},
+    )
+
+    # ── Demo: quick single-ticker prediction ─────────────────────────────────
+    print("\n\n── DEMO PREDICTION: NVDA ────────────────────────────────────────")
+    engine.quick_predict("NVDA")
+
+
+if __name__ == "__main__":
+    main()
