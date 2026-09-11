@@ -1,0 +1,3637 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+SmartInvest 5.1 BETA 4 — Colab-ready research system.
+
+Core design:
+  * four-model predictive ensemble: Transformer + XGBoost + Random Forest + Ridge
+  * per-model walk-forward validation and persistent model governance
+  * Confidence 2.1, structured Investment Committee scores and hard gates
+  * Risk Parity, Max Sortino and Black-Litterman portfolio optimization
+  * optimizer -> Digital Twin -> constraint adjustment -> re-optimize loop
+  * strategy backtest kept separate from model validation, including trading
+    costs, turnover, a cash bucket and volatility-scaled trailing stops
+
+This is research software, not financial advice. It never creates synthetic
+market observations for a recommendation. Missing sources degrade explicitly.
+
+Colab:
+    %run SmartInvest_5_1_BETA_4.py
+    report = run_smartinvest_beta4(["AAPL", "MSFT", "NVDA"],
+                                   optimizer_method="black_litterman")
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import sqlite3
+import subprocess
+import sys
+import time
+import traceback
+import warnings
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timedelta, timezone
+from enum import Enum
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+
+import numpy as np
+import pandas as pd
+
+warnings.filterwarnings("ignore")
+
+try:
+    import google.colab  # noqa: F401
+    IN_COLAB = True
+except ImportError:
+    IN_COLAB = False
+
+AUTO_INSTALL = IN_COLAB or os.getenv("SMARTINVEST_AUTO_INSTALL", "") == "1"
+
+
+def _ensure_package(import_name: str, pip_name: Optional[str] = None,
+                    auto_install: Optional[bool] = None) -> bool:
+    try:
+        __import__(import_name)
+        return True
+    except ImportError:
+        pass
+    install = AUTO_INSTALL if auto_install is None else auto_install
+    if not install:
+        return False
+    try:
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q",
+                        pip_name or import_name], check=True)
+        __import__(import_name)
+        return True
+    except Exception as exc:
+        print(f"[setup] Optional dependency {pip_name or import_name!r} unavailable: {exc}")
+        return False
+
+
+YFINANCE_OK = _ensure_package("yfinance")
+SKLEARN_OK = _ensure_package("sklearn", "scikit-learn")
+SCIPY_OK = _ensure_package("scipy")
+XGBOOST_OK = _ensure_package("xgboost")
+REQUESTS_OK = _ensure_package("requests", auto_install=False)
+TF_OK = _ensure_package("tensorflow", "tensorflow")
+
+if YFINANCE_OK:
+    import yfinance as yf
+else:
+    yf = None
+
+if SKLEARN_OK:
+    from sklearn.ensemble import RandomForestRegressor
+    from sklearn.linear_model import Ridge
+    from sklearn.model_selection import TimeSeriesSplit
+    from sklearn.preprocessing import StandardScaler
+
+if SCIPY_OK:
+    from scipy.optimize import minimize
+
+if XGBOOST_OK:
+    import xgboost as xgb
+
+if REQUESTS_OK:
+    import requests
+else:
+    requests = None
+
+if TF_OK:
+    os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+    import tensorflow as tf
+    from tensorflow.keras import Model, callbacks, layers
+
+
+class SecureConfig:
+    ALPHA_VANTAGE_KEY = os.getenv("ALPHA_VANTAGE_KEY", "")
+    FRED_API_KEY = os.getenv("FRED_API_KEY", "")
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+    CACHE_DB = os.getenv("SMARTINVEST_CACHE_DB", "smartinvest_beta4.db")
+    MAX_STALE_DAYS = int(os.getenv("SMARTINVEST_MAX_STALE_DAYS", "5"))
+    TRANSFORMER_EPOCHS = int(os.getenv("SMARTINVEST_TRANSFORMER_EPOCHS", "12"))
+    TRANSFORMER_SEQUENCE = int(os.getenv("SMARTINVEST_TRANSFORMER_SEQUENCE", "20"))
+    MC_SIMULATIONS = int(os.getenv("SMARTINVEST_MC_SIMS", "3000"))
+    MC_HORIZON = int(os.getenv("SMARTINVEST_MC_HORIZON", "63"))
+    RISK_FREE_RATE = float(os.getenv("SMARTINVEST_RISK_FREE", "0.04"))
+
+
+def log(message: str, level: str = "INFO") -> None:
+    print(f"[{datetime.now():%H:%M:%S}] [{level:^7}] {message}")
+
+
+def _safe_float(value: Any) -> Optional[float]:
+    try:
+        out = float(value)
+        return out if np.isfinite(out) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _clip(value: float, low: float, high: float) -> float:
+    return float(max(low, min(high, value)))
+
+
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return None if not np.isfinite(value) else float(value)
+    if isinstance(value, (pd.Timestamp, datetime)):
+        return value.isoformat()
+    raise TypeError(f"Not JSON serializable: {type(value).__name__}")
+
+
+class DataStatus(str, Enum):
+    LIVE = "LIVE"
+    CACHED = "CACHED"
+    DEGRADED = "DEGRADED"
+    INVALID = "INVALID"
+
+
+@dataclass
+class DataIntegrityReport:
+    ticker: str
+    status: DataStatus
+    confidence_score: float
+    source: str
+    last_date: Optional[str]
+    rows: int
+    stale_days: int
+    missing_trading_days: int
+    outliers_detected: int
+    cross_check_diff_pct: Optional[float]
+    source_disagreement: float
+    warnings: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        result = asdict(self)
+        result["status"] = self.status.value
+        return result
+
+
+class DataIntegrityEngine:
+    """Live-first OHLCV loader with SQLite fallback and optional AV cross-check."""
+
+    def __init__(self, db_path: str = SecureConfig.CACHE_DB):
+        self.db_path = db_path
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""CREATE TABLE IF NOT EXISTS price_cache_v4 (
+                ticker TEXT, date TEXT, open REAL, high REAL, low REAL,
+                close REAL, volume REAL, PRIMARY KEY (ticker, date))""")
+
+    @staticmethod
+    def _normalize(raw: pd.DataFrame) -> pd.DataFrame:
+        if raw is None or raw.empty:
+            return pd.DataFrame()
+        df = raw.copy()
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [c[0] for c in df.columns]
+        df.columns = [str(c).title() for c in df.columns]
+        wanted = [c for c in ("Open", "High", "Low", "Close", "Volume") if c in df]
+        df = df[wanted].replace([np.inf, -np.inf], np.nan)
+        df.index = pd.to_datetime(df.index).tz_localize(None)
+        return df[~df.index.duplicated(keep="last")].sort_index().dropna(subset=["Close"])
+
+    def _write_cache(self, ticker: str, df: pd.DataFrame) -> None:
+        rows = []
+        for dt, row in df.iterrows():
+            rows.append((ticker, str(dt.date()), *[_safe_float(row.get(k)) for k in
+                                                     ("Open", "High", "Low", "Close", "Volume")]))
+        with sqlite3.connect(self.db_path) as conn:
+            conn.executemany("INSERT OR REPLACE INTO price_cache_v4 VALUES (?,?,?,?,?,?,?)", rows)
+
+    def _read_cache(self, ticker: str) -> pd.DataFrame:
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute("SELECT date,open,high,low,close,volume FROM price_cache_v4 "
+                                "WHERE ticker=? ORDER BY date", (ticker,)).fetchall()
+        if not rows:
+            return pd.DataFrame()
+        return pd.DataFrame(rows, columns=["Date", "Open", "High", "Low", "Close", "Volume"]).set_index(
+            pd.to_datetime(pd.Series([r[0] for r in rows])))
+
+    @staticmethod
+    def _alpha_vantage_close(ticker: str) -> Optional[float]:
+        if not (REQUESTS_OK and SecureConfig.ALPHA_VANTAGE_KEY):
+            return None
+        try:
+            response = requests.get("https://www.alphavantage.co/query", params={
+                "function": "GLOBAL_QUOTE", "symbol": ticker,
+                "apikey": SecureConfig.ALPHA_VANTAGE_KEY}, timeout=12)
+            response.raise_for_status()
+            return _safe_float(response.json().get("Global Quote", {}).get("05. price"))
+        except Exception:
+            return None
+
+    def fetch(self, ticker: str, period: str = "5y") -> Tuple[Optional[pd.DataFrame], DataIntegrityReport]:
+        ticker = ticker.upper().strip()
+        source, status, warnings_list = "none", DataStatus.INVALID, []
+        df = pd.DataFrame()
+        if YFINANCE_OK:
+            try:
+                df = self._normalize(yf.download(ticker, period=period, auto_adjust=True,
+                                                 progress=False, threads=False))
+                if not df.empty:
+                    source, status = "yfinance", DataStatus.LIVE
+                    self._write_cache(ticker, df)
+            except Exception as exc:
+                warnings_list.append(f"Live download failed: {exc}")
+        if df.empty:
+            df = self._read_cache(ticker)
+            if not df.empty:
+                source, status = "sqlite-cache", DataStatus.CACHED
+        if df.empty or "Close" not in df or len(df) < 80:
+            warnings_list.append("No trustworthy history or fewer than 80 observations.")
+            return None, DataIntegrityReport(ticker, DataStatus.INVALID, 0.0, source, None,
+                                               len(df), 999, 0, 0, None, 100.0, warnings_list)
+
+        today = pd.Timestamp.now().normalize()
+        stale = max(0, int((today - df.index.max().normalize()).days))
+        expected = pd.bdate_range(df.index.min(), df.index.max())
+        missing = max(0, len(expected.difference(df.index.normalize())))
+        returns = df["Close"].pct_change()
+        median = returns.median()
+        mad = np.median(np.abs(returns.dropna() - median))
+        robust_z = np.abs(returns - median) / max(1.4826 * mad, 1e-8)
+        outliers = int((robust_z > 12).sum())
+
+        av_close = self._alpha_vantage_close(ticker)
+        cross_diff = None
+        disagreement = 0.0
+        if av_close and av_close > 0:
+            cross_diff = abs(float(df["Close"].iloc[-1]) / av_close - 1.0) * 100
+            disagreement = _clip(cross_diff * 8.0, 0.0, 100.0)
+            if cross_diff > 2.0:
+                warnings_list.append(f"Independent close differs by {cross_diff:.2f}%.")
+
+        confidence = 100.0
+        confidence -= min(35.0, stale * 6.0)
+        confidence -= min(15.0, missing / max(len(df), 1) * 500.0)
+        confidence -= min(20.0, outliers * 2.0)
+        confidence -= min(25.0, disagreement * 0.25)
+        if status == DataStatus.CACHED:
+            confidence -= 10.0
+        if stale > SecureConfig.MAX_STALE_DAYS or confidence < 75:
+            status = DataStatus.DEGRADED if confidence >= 40 else DataStatus.INVALID
+        confidence = _clip(confidence, 0.0, 100.0)
+        return df, DataIntegrityReport(
+            ticker, status, round(confidence, 1), source, str(df.index.max().date()), len(df),
+            stale, missing, outliers, round(cross_diff, 2) if cross_diff is not None else None,
+            round(disagreement, 1), warnings_list)
+
+
+def build_features(df: pd.DataFrame, horizon: int = 5) -> pd.DataFrame:
+    close = df["Close"].astype(float)
+    high = df.get("High", close).astype(float)
+    low = df.get("Low", close).astype(float)
+    volume = df.get("Volume", pd.Series(0.0, index=df.index)).astype(float)
+    out = pd.DataFrame(index=df.index)
+    for lag in (1, 2, 5, 10, 20, 60):
+        out[f"ret_{lag}"] = close.pct_change(lag)
+    for window in (5, 10, 20, 50, 100):
+        out[f"sma_ratio_{window}"] = close / close.rolling(window).mean() - 1
+    out["vol_10"] = close.pct_change().rolling(10).std()
+    out["vol_20"] = close.pct_change().rolling(20).std()
+    out["vol_60"] = close.pct_change().rolling(60).std()
+    delta = close.diff()
+    gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
+    out["rsi_14"] = 100 - 100 / (1 + gain / loss.replace(0, np.nan))
+    macd = close.ewm(span=12, adjust=False).mean() - close.ewm(span=26, adjust=False).mean()
+    out["macd_hist"] = macd - macd.ewm(span=9, adjust=False).mean()
+    out["range"] = (high - low) / close.replace(0, np.nan)
+    out["volume_z"] = (volume - volume.rolling(20).mean()) / volume.rolling(20).std().replace(0, np.nan)
+    out["drawdown_60"] = close / close.rolling(60).max() - 1
+    out["target_fwd_ret"] = close.shift(-horizon) / close - 1
+    return out.replace([np.inf, -np.inf], np.nan)
+
+
+def label_regime(df: pd.DataFrame, window: int = 60) -> pd.Series:
+    close = df["Close"].astype(float)
+    trend = close.pct_change(window)
+    vol = close.pct_change().rolling(window).std() * math.sqrt(252)
+    regime = pd.Series("sideways", index=df.index)
+    regime[trend > 0.12] = "bull"
+    regime[trend < -0.12] = "bear"
+    regime[(vol > 0.42) & (trend < -0.05)] = "crisis"
+    regime[(vol > 0.35) & (regime == "sideways")] = "high_volatility"
+    return regime
+
+
+class TimeSeriesTransformerRegressor:
+    """Small residual Transformer adapted from SmartInvest 5.0."""
+
+    def __init__(self, sequence_length: int = SecureConfig.TRANSFORMER_SEQUENCE,
+                 epochs: int = SecureConfig.TRANSFORMER_EPOCHS, seed: int = 42):
+        self.sequence_length = int(sequence_length)
+        self.epochs = int(epochs)
+        self.seed = int(seed)
+        self.model: Optional[Any] = None
+        self.history_tail: Optional[np.ndarray] = None
+
+    def _build(self, n_features: int) -> Any:
+        tf.keras.utils.set_random_seed(self.seed)
+        inputs = layers.Input((self.sequence_length, n_features))
+        positions = tf.range(start=0, limit=self.sequence_length, delta=1)
+        pos = layers.Embedding(self.sequence_length, n_features)(positions)
+        x = inputs + pos
+        for _ in range(2):
+            attn = layers.MultiHeadAttention(num_heads=4, key_dim=max(4, n_features // 2),
+                                             dropout=0.10)(x, x)
+            x = layers.LayerNormalization(epsilon=1e-6)(x + layers.Dropout(0.10)(attn))
+            ff = layers.Dense(64, activation="gelu")(x)
+            ff = layers.Dropout(0.10)(ff)
+            ff = layers.Dense(n_features)(ff)
+            x = layers.LayerNormalization(epsilon=1e-6)(x + ff)
+        x = layers.GlobalAveragePooling1D()(x)
+        x = layers.Dense(32, activation="gelu")(x)
+        outputs = layers.Dense(1)(x)
+        model = Model(inputs, outputs, name="smartinvest_time_series_transformer")
+        model.compile(optimizer=tf.keras.optimizers.Adam(3e-4), loss="huber")
+        return model
+
+    def fit(self, X: np.ndarray, y: np.ndarray) -> "TimeSeriesTransformerRegressor":
+        if not TF_OK:
+            raise RuntimeError("TensorFlow is unavailable")
+        seq = min(self.sequence_length, max(5, len(X) // 5))
+        self.sequence_length = seq
+        X_seq = np.asarray([X[i - seq + 1:i + 1] for i in range(seq - 1, len(X))])
+        y_seq = np.asarray(y[seq - 1:])
+        if len(X_seq) < 25:
+            raise ValueError("Too few sequences for Transformer")
+        self.model = self._build(X.shape[1])
+        val_split = 0.15 if len(X_seq) >= 80 else 0.0
+        cb = [callbacks.EarlyStopping(monitor="val_loss" if val_split else "loss",
+                                      patience=3, restore_best_weights=True)]
+        self.model.fit(X_seq, y_seq, epochs=self.epochs, batch_size=32,
+                       validation_split=val_split, shuffle=False, verbose=0, callbacks=cb)
+        self.history_tail = np.asarray(X[-(seq - 1):], dtype=float)
+        return self
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        if self.model is None or self.history_tail is None:
+            raise RuntimeError("Transformer is not fitted")
+        joined = np.vstack([self.history_tail, np.asarray(X, dtype=float)])
+        offset = len(self.history_tail)
+        sequences = [joined[i - self.sequence_length + 1:i + 1]
+                     for i in range(offset, len(joined))]
+        return self.model.predict(np.asarray(sequences), verbose=0).reshape(-1)
+
+
+class ModelEnsemble:
+    MODEL_ORDER = ("transformer", "xgboost", "random_forest", "ridge")
+
+    def __init__(self):
+        if not SKLEARN_OK:
+            raise RuntimeError("scikit-learn is required")
+        self.scaler = StandardScaler()
+        self.models: Dict[str, Any] = {}
+        self.weights: Dict[str, float] = {}
+        self.feature_cols: List[str] = []
+
+    def fit(self, X: pd.DataFrame, y: pd.Series) -> "ModelEnsemble":
+        self.feature_cols = list(X.columns)
+        Xs = self.scaler.fit_transform(X.values)
+        candidates: Dict[str, Any] = {
+            "random_forest": RandomForestRegressor(n_estimators=250, max_depth=7,
+                min_samples_leaf=5, max_features=0.8, n_jobs=-1, random_state=42),
+            "ridge": Ridge(alpha=2.0),
+        }
+        if XGBOOST_OK:
+            candidates["xgboost"] = xgb.XGBRegressor(
+                n_estimators=250, max_depth=4, learning_rate=0.035,
+                subsample=0.8, colsample_bytree=0.8, reg_lambda=2.0,
+                objective="reg:squarederror", random_state=42, verbosity=0)
+        if TF_OK:
+            candidates["transformer"] = TimeSeriesTransformerRegressor()
+        self.models = {}
+        for name, model in candidates.items():
+            try:
+                model.fit(Xs, y.values)
+                self.models[name] = model
+            except Exception as exc:
+                log(f"{name} unavailable for this fit: {exc}", "WARN")
+        if not self.models:
+            raise RuntimeError("No ensemble model could be fitted")
+        self.weights = {name: 1 / len(self.models) for name in self.models}
+        return self
+
+    def set_weights(self, weights: Dict[str, float]) -> None:
+        selected = {n: max(0.0, float(weights.get(n, 0.0))) for n in self.models}
+        total = sum(selected.values())
+        self.weights = ({n: w / total for n, w in selected.items()} if total > 0 else
+                        {n: 1 / len(self.models) for n in self.models})
+
+    def predict_all(self, X: pd.DataFrame) -> Dict[str, np.ndarray]:
+        Xs = self.scaler.transform(X[self.feature_cols].values)
+        return {name: np.asarray(model.predict(Xs), dtype=float).reshape(-1)
+                for name, model in self.models.items()}
+
+    def predict(self, X: pd.DataFrame) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+        all_predictions = self.predict_all(X)
+        total = sum(self.weights.get(n, 0.0) for n in all_predictions)
+        blended = sum(all_predictions[n] * self.weights.get(n, 0.0)
+                      for n in all_predictions) / max(total, 1e-12)
+        return np.asarray(blended), all_predictions
+
+
+@dataclass
+class FoldModelMetric:
+    mae: float
+    hit_rate: float
+    calibration_error: float
+    prediction_drift: float
+    recent_hit_rate: float
+    regime_accuracy: Dict[str, float]
+    residual_std: float
+
+
+@dataclass
+class FoldResult:
+    fold: int
+    test_start: str
+    test_end: str
+    n_test: int
+    regime_mix: Dict[str, float]
+    per_model: Dict[str, FoldModelMetric]
+    ensemble_mae: float
+    ensemble_hit_rate: float
+    ensemble_sharpe: float
+    ensemble_sortino: float
+
+
+@dataclass
+class ModelValidationMetric:
+    mae: float
+    hit_rate: float
+    recent_hit_rate: float
+    calibration_error: float
+    prediction_drift: float
+    residual_std: float
+    regime_accuracy: Dict[str, float]
+    severe_degradation: bool
+
+
+@dataclass
+class ValidationReport:
+    ticker: str
+    folds: List[FoldResult]
+    per_model: Dict[str, ModelValidationMetric]
+    overall_directional_accuracy: float
+    overall_mae: float
+    regime_accuracy: Dict[str, float]
+    degrading: bool
+    degradation_note: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+def _model_metric(prediction: np.ndarray, actual: np.ndarray, regimes: pd.Series,
+                  train_target: np.ndarray) -> FoldModelMetric:
+    prediction, actual = np.asarray(prediction), np.asarray(actual)
+    hit = np.sign(prediction) == np.sign(actual)
+    noise = max(float(np.std(train_target)), 1e-4)
+    probabilities = 1 / (1 + np.exp(np.clip(-prediction / noise, -30, 30)))
+    observed = (actual > 0).astype(float)
+    brier = float(np.mean((probabilities - observed) ** 2))
+    drift = abs(float(np.mean(prediction)) - float(np.mean(train_target))) / noise
+    recent_n = max(5, len(hit) // 3)
+    regime_accuracy = {}
+    for regime in pd.unique(regimes):
+        mask = np.asarray(regimes == regime)
+        if mask.any():
+            regime_accuracy[str(regime)] = round(float(np.mean(hit[mask])), 4)
+    return FoldModelMetric(
+        mae=round(float(np.mean(np.abs(prediction - actual))), 6),
+        hit_rate=round(float(np.mean(hit)), 4),
+        calibration_error=round(brier, 5), prediction_drift=round(drift, 4),
+        recent_hit_rate=round(float(np.mean(hit[-recent_n:])), 4),
+        regime_accuracy=regime_accuracy,
+        residual_std=round(float(np.std(actual - prediction)), 6))
+
+
+def walk_forward_validate(features: pd.DataFrame, regimes: pd.Series, ticker: str,
+                          n_splits: int = 5, min_train: int = 180,
+                          horizon: int = 5) -> ValidationReport:
+    data = features.dropna().copy()
+    empty = ValidationReport(ticker, [], {}, float("nan"), float("nan"), {}, False,
+                             "Insufficient history for walk-forward validation.")
+    if len(data) < min_train + 40:
+        return empty
+    feature_cols = [c for c in data if c != "target_fwd_ret"]
+    X, y = data[feature_cols], data["target_fwd_ret"]
+    aligned_regimes = regimes.reindex(data.index).fillna("sideways")
+    test_size = max(20, min(63, len(data) // (n_splits + 3)))
+    splitter = TimeSeriesSplit(n_splits=n_splits, test_size=test_size, gap=max(0, horizon - 1))
+    folds: List[FoldResult] = []
+    pooled_hits: Dict[str, Dict[str, List[int]]] = {}
+
+    for fold_id, (train_idx, test_idx) in enumerate(splitter.split(X), 1):
+        if len(train_idx) < min_train:
+            continue
+        X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+        reg_test = aligned_regimes.iloc[test_idx]
+        try:
+            ensemble = ModelEnsemble().fit(X_train, y_train)
+            predictions = ensemble.predict_all(X_test)
+        except Exception as exc:
+            log(f"{ticker} fold {fold_id} skipped: {exc}", "WARN")
+            continue
+        metrics = {}
+        for name, pred in predictions.items():
+            metrics[name] = _model_metric(pred, y_test.values, reg_test, y_train.values)
+            pooled_hits.setdefault(name, {})
+            hits = np.sign(pred) == np.sign(y_test.values)
+            for regime in pd.unique(reg_test):
+                mask = np.asarray(reg_test == regime)
+                pooled_hits[name].setdefault(str(regime), []).extend(hits[mask].astype(int).tolist())
+        blended = np.mean(np.vstack(list(predictions.values())), axis=0)
+        strategy_returns = np.where(blended > 0, y_test.values, 0.0)
+        mean_ret, std_ret = float(np.mean(strategy_returns)), float(np.std(strategy_returns))
+        downside = strategy_returns[strategy_returns < 0]
+        downside_std = float(np.std(downside)) if len(downside) else 0.0
+        ann = math.sqrt(252 / max(horizon, 1))
+        folds.append(FoldResult(
+            fold_id, str(X_test.index.min().date()), str(X_test.index.max().date()), len(test_idx),
+            {str(k): round(float(v), 4) for k, v in reg_test.value_counts(normalize=True).items()},
+            metrics, round(float(np.mean(np.abs(blended - y_test.values))), 6),
+            round(float(np.mean(np.sign(blended) == np.sign(y_test.values))), 4),
+            round(mean_ret / std_ret * ann, 3) if std_ret > 1e-9 else 0.0,
+            round(mean_ret / downside_std * ann, 3) if downside_std > 1e-9 else 0.0))
+
+    if not folds:
+        return empty
+    names = sorted({name for fold in folds for name in fold.per_model})
+    aggregated: Dict[str, ModelValidationMetric] = {}
+    for name in names:
+        values = [fold.per_model[name] for fold in folds if name in fold.per_model]
+        regime_acc = {regime: round(float(np.mean(hits)), 4)
+                      for regime, hits in pooled_hits.get(name, {}).items() if hits}
+        last_hit = values[-1].recent_hit_rate
+        slopes = np.polyfit(np.arange(len(values)), [v.hit_rate for v in values], 1)[0] if len(values) >= 3 else 0
+        severe = bool(last_hit < 0.40 or slopes < -0.05 or values[-1].prediction_drift > 2.5)
+        aggregated[name] = ModelValidationMetric(
+            round(float(np.mean([v.mae for v in values])), 6),
+            round(float(np.mean([v.hit_rate for v in values])), 4), last_hit,
+            round(float(np.mean([v.calibration_error for v in values])), 5),
+            round(float(np.mean([v.prediction_drift for v in values])), 4),
+            round(float(np.mean([v.residual_std for v in values])), 6), regime_acc, severe)
+    fold_acc = np.asarray([f.ensemble_hit_rate for f in folds])
+    slope = float(np.polyfit(np.arange(len(fold_acc)), fold_acc, 1)[0]) if len(fold_acc) >= 3 else 0
+    degrading = bool(slope < -0.03 or fold_acc[-1] < 0.45)
+    note = (f"Ensemble OOS hit-rate slope {slope:+.3f}/fold; latest {fold_acc[-1]:.1%}."
+            if degrading else "No severe ensemble degradation detected.")
+    ensemble_regime: Dict[str, List[float]] = {}
+    for fold in folds:
+        for regime in fold.regime_mix:
+            available = [m.regime_accuracy[regime] for m in fold.per_model.values()
+                         if regime in m.regime_accuracy]
+            if available:
+                ensemble_regime.setdefault(regime, []).append(float(np.mean(available)))
+    return ValidationReport(
+        ticker, folds, aggregated, round(float(np.mean(fold_acc)), 4),
+        round(float(np.mean([f.ensemble_mae for f in folds])), 6),
+        {k: round(float(np.mean(v)), 4) for k, v in ensemble_regime.items()},
+        degrading, note)
+
+
+class ModelGovernance:
+    """Stores true per-model/per-regime OOS metrics and computes live weights.
+
+    score = OOS skill × regime reliability × recent accuracy × calibration
+            quality × drift/degradation multiplier.
+    """
+
+    def __init__(self, db_path: str = SecureConfig.CACHE_DB):
+        self.db_path = db_path
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""CREATE TABLE IF NOT EXISTS model_performance_v4 (
+                ticker TEXT, model_name TEXT, metric_date TEXT, fold INTEGER,
+                regime TEXT, mae REAL, hit_rate REAL, recent_hit_rate REAL,
+                calibration_error REAL, prediction_drift REAL,
+                residual_std REAL, severe_degradation INTEGER,
+                PRIMARY KEY (ticker, model_name, metric_date, fold, regime))""")
+
+    def log_fold_results(self, ticker: str, validation: ValidationReport) -> None:
+        rows = []
+        for fold in validation.folds:
+            for model_name, metric in fold.per_model.items():
+                severe = int(validation.per_model.get(model_name,
+                    ModelValidationMetric(0, 0, 0, 1, 99, 0, {}, True)).severe_degradation)
+                rows.append((ticker, model_name, fold.test_end, fold.fold, "__overall__",
+                             metric.mae, metric.hit_rate, metric.recent_hit_rate,
+                             metric.calibration_error, metric.prediction_drift,
+                             metric.residual_std, severe))
+                for regime, regime_hit in metric.regime_accuracy.items():
+                    rows.append((ticker, model_name, fold.test_end, fold.fold, regime,
+                                 metric.mae, regime_hit, metric.recent_hit_rate,
+                                 metric.calibration_error, metric.prediction_drift,
+                                 metric.residual_std, severe))
+        with sqlite3.connect(self.db_path) as conn:
+            conn.executemany("INSERT OR REPLACE INTO model_performance_v4 VALUES "
+                             "(?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+
+    def rolling_metrics(self, ticker: str, model_name: str, days: int,
+                        as_of: Optional[str] = None) -> Dict[str, Optional[float]]:
+        as_of_date = pd.Timestamp(as_of or datetime.now().date())
+        cutoff = str((as_of_date - pd.Timedelta(days=days)).date())
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute("""SELECT mae,hit_rate,recent_hit_rate,
+                calibration_error,prediction_drift FROM model_performance_v4
+                WHERE ticker=? AND model_name=? AND regime='__overall__'
+                AND metric_date BETWEEN ? AND ?""",
+                (ticker, model_name, cutoff, str(as_of_date.date()))).fetchall()
+        if not rows:
+            return {k: None for k in ("mae", "hit_rate", "recent_hit_rate",
+                                      "calibration_error", "prediction_drift")}
+        arr = np.asarray(rows, dtype=float)
+        return dict(zip(("mae", "hit_rate", "recent_hit_rate", "calibration_error",
+                         "prediction_drift"), np.mean(arr, axis=0).tolist()))
+
+    def dynamic_weights(self, ticker: str, validation: ValidationReport,
+                        current_regime: str) -> Tuple[Dict[str, float], Dict[str, Dict[str, float]]]:
+        raw, components = {}, {}
+        as_of = validation.folds[-1].test_end if validation.folds else None
+        for name, metric in validation.per_model.items():
+            m30 = self.rolling_metrics(ticker, name, 30, as_of)
+            m90 = self.rolling_metrics(ticker, name, 90, as_of)
+            recent = m30["recent_hit_rate"] or metric.recent_hit_rate
+            base_hit = m90["hit_rate"] or metric.hit_rate
+            # Skill is zero near 45% and approaches one at 60%+; MAE adds a
+            # bounded quality correction without making cross-ticker comparisons.
+            directional_skill = _clip((base_hit - 0.45) / 0.15, 0.02, 1.0)
+            mae_quality = 1.0 / (1.0 + metric.mae / max(metric.residual_std, 1e-5))
+            oos_skill = _clip(0.75 * directional_skill + 0.25 * mae_quality, 0.02, 1.0)
+            regime_rel = metric.regime_accuracy.get(current_regime, metric.hit_rate)
+            regime_rel = _clip((regime_rel - 0.40) / 0.25, 0.05, 1.0)
+            recent_accuracy = _clip((recent - 0.38) / 0.27, 0.03, 1.0)
+            calibration_quality = _clip(1.0 - metric.calibration_error / 0.30, 0.05, 1.0)
+            drift_quality = _clip(1.0 - metric.prediction_drift / 3.0, 0.05, 1.0)
+            degradation = 0.02 if metric.severe_degradation else (0.55 if validation.degrading else 1.0)
+            score = oos_skill * regime_rel * recent_accuracy * calibration_quality * drift_quality * degradation
+            raw[name] = max(1e-6, score)
+            components[name] = {
+                "oos_skill": round(oos_skill, 4),
+                "regime_reliability": round(regime_rel, 4),
+                "recent_accuracy": round(recent_accuracy, 4),
+                "calibration_quality": round(calibration_quality, 4),
+                "drift_quality": round(drift_quality, 4),
+                "degradation_multiplier": round(degradation, 4),
+                "raw_score": round(score, 6),
+                "accuracy_30d": round(float(m30["hit_rate"]), 4) if m30["hit_rate"] is not None else None,
+                "accuracy_90d": round(float(m90["hit_rate"]), 4) if m90["hit_rate"] is not None else None,
+            }
+        total = sum(raw.values())
+        weights = {name: round(score / total, 6) for name, score in raw.items()}
+        return weights, components
+
+    def dashboard_rows(self, tickers: Sequence[str]) -> List[Dict[str, Any]]:
+        rows = []
+        with sqlite3.connect(self.db_path) as conn:
+            for ticker in tickers:
+                names = [r[0] for r in conn.execute(
+                    "SELECT DISTINCT model_name FROM model_performance_v4 WHERE ticker=?", (ticker,))]
+                as_of_row = conn.execute("SELECT MAX(metric_date) FROM model_performance_v4 WHERE ticker=?",
+                                         (ticker,)).fetchone()
+                as_of = as_of_row[0] if as_of_row else None
+                for name in names:
+                    m30, m90 = self.rolling_metrics(ticker, name, 30, as_of), self.rolling_metrics(ticker, name, 90, as_of)
+                    rows.append({"ticker": ticker, "model": name,
+                                 "hit_rate_30d": m30["hit_rate"], "hit_rate_90d": m90["hit_rate"],
+                                 "mae_90d": m90["mae"], "calibration_error_90d": m90["calibration_error"],
+                                 "prediction_drift_30d": m30["prediction_drift"]})
+        return rows
+
+
+@dataclass
+class PredictionConfidence21:
+    ticker: str
+    expected_return_pct: float
+    interval_low_pct: float
+    interval_high_pct: float
+    direction_probability_pct: float
+    model_agreement: str
+    historical_calibration_pct: float
+    calibration_error: float
+    ensemble_uncertainty_pct: float
+    bootstrap_uncertainty_pct: float
+    regime_transition_uncertainty: float
+    data_source_disagreement: float
+    model_drift_penalty: float
+    data_quality_penalty: float
+    event_risk_penalty: float
+    concentration_penalty: float
+    conviction_score: float
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+def compute_prediction_confidence_21(
+        ticker: str, ensemble_prediction: float, model_predictions: Dict[str, float],
+        validation: ValidationReport, current_regime: str, regimes: pd.Series,
+        data_confidence: float, source_disagreement: float, event_risk: float,
+        portfolio_weight: float = 0.0) -> PredictionConfidence21:
+    values = np.asarray(list(model_predictions.values()), dtype=float)
+    model_std = float(np.std(values)) if len(values) > 1 else 0.0
+    residuals = [m.residual_std for m in validation.per_model.values() if m.residual_std > 0]
+    bootstrap_std = float(np.median(residuals)) if residuals else max(abs(ensemble_prediction), 0.02)
+    scale = max(abs(ensemble_prediction), bootstrap_std, 0.005)
+    relative_disagreement = model_std / scale
+    if relative_disagreement < 0.35:
+        agreement, agreement_score = "High", 92.0
+    elif relative_disagreement < 0.85:
+        agreement, agreement_score = "Medium", 68.0
+    else:
+        agreement, agreement_score = "Low", 35.0
+
+    metric_values = list(validation.per_model.values())
+    calibration_error = float(np.mean([m.calibration_error for m in metric_values])) if metric_values else 0.25
+    regime_hits = [m.regime_accuracy[current_regime] for m in metric_values
+                   if current_regime in m.regime_accuracy]
+    historical_calibration = float(np.mean(regime_hits)) if regime_hits else validation.overall_directional_accuracy
+    if not np.isfinite(historical_calibration):
+        historical_calibration = 0.5
+    recent_regimes = regimes.dropna().iloc[-20:]
+    transitions = float((recent_regimes != recent_regimes.shift()).mean()) if len(recent_regimes) > 1 else 0.0
+    transition_uncertainty = _clip(transitions * 180.0, 0.0, 100.0)
+    drift = float(np.mean([m.prediction_drift for m in metric_values])) if metric_values else 1.0
+
+    # Probability is tied to OOS calibration and prediction-to-noise ratio.
+    z = ensemble_prediction / max(bootstrap_std, 1e-4)
+    signal_probability = 1 / (1 + math.exp(_clip(-1.35 * z, -30, 30)))
+    if ensemble_prediction >= 0:
+        direction_probability = 0.55 * signal_probability + 0.45 * historical_calibration
+    else:
+        direction_probability = 0.55 * (1 - signal_probability) + 0.45 * historical_calibration
+
+    data_penalty = max(0.0, 100 - data_confidence) * 0.35
+    source_penalty = source_disagreement * 0.10
+    event_penalty = event_risk * 0.18
+    drift_penalty = _clip(drift * 6.0 + (12.0 if validation.degrading else 0.0), 0.0, 25.0)
+    concentration_penalty = _clip(max(0.0, portfolio_weight - 0.15) * 100.0, 0.0, 20.0)
+    transition_penalty = transition_uncertainty * 0.12
+    calibration_quality = _clip((0.30 - calibration_error) / 0.20 * 100, 0.0, 100.0)
+    uncertainty_quality = _clip(100 - (model_std + bootstrap_std) / scale * 35, 0.0, 100.0)
+    conviction = (0.24 * agreement_score + 0.24 * historical_calibration * 100 +
+                  0.18 * direction_probability * 100 + 0.18 * calibration_quality +
+                  0.16 * uncertainty_quality)
+    conviction -= data_penalty + source_penalty + event_penalty + drift_penalty
+    conviction -= concentration_penalty + transition_penalty
+    interval_half = 1.28 * math.sqrt(bootstrap_std ** 2 + model_std ** 2)
+    return PredictionConfidence21(
+        ticker, round(ensemble_prediction * 100, 3),
+        round((ensemble_prediction - interval_half) * 100, 3),
+        round((ensemble_prediction + interval_half) * 100, 3),
+        round(direction_probability * 100, 2), agreement,
+        round(historical_calibration * 100, 2), round(calibration_error, 5),
+        round(model_std * 100, 3), round(bootstrap_std * 100, 3),
+        round(transition_uncertainty, 2), round(source_disagreement, 2),
+        round(drift_penalty, 2), round(data_penalty, 2), round(event_penalty, 2),
+        round(concentration_penalty, 2), round(_clip(conviction, 0, 100), 2))
+
+
+@dataclass
+class FundamentalReport:
+    ticker: str
+    available: bool
+    sector: str
+    fundamental_score: float
+    valuation_flag: str
+    trailing_pe: Optional[float]
+    sector_median_pe: Optional[float]
+    sector_relative_pe: Optional[float]
+    historical_pe_percentile: Optional[float]
+    fcf_yield_pct: Optional[float]
+    roic_pct: Optional[float]
+    wacc_pct: Optional[float]
+    roic_minus_wacc_pct: Optional[float]
+    net_debt_to_ebitda: Optional[float]
+    earnings_quality: Optional[float]
+    margin_trend_pct_points: Optional[float]
+    revenue_growth_pct: Optional[float]
+    earnings_growth_pct: Optional[float]
+    revenue_revision_pct: Optional[float]
+    earnings_revision_pct: Optional[float]
+    notes: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+class FundamentalEngine:
+    def __init__(self, db_path: str = SecureConfig.CACHE_DB):
+        self._info_cache: Dict[str, Dict[str, Any]] = {}
+        self.db_path = db_path
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""CREATE TABLE IF NOT EXISTS estimate_snapshots_v4 (
+                ticker TEXT, snapshot_date TEXT, revenue_estimate REAL,
+                earnings_estimate REAL, PRIMARY KEY (ticker, snapshot_date))""")
+
+    def _info(self, ticker: str) -> Dict[str, Any]:
+        if ticker not in self._info_cache:
+            try:
+                self._info_cache[ticker] = yf.Ticker(ticker).info or {}
+            except Exception:
+                self._info_cache[ticker] = {}
+        return self._info_cache[ticker]
+
+    @staticmethod
+    def _statement_row(frame: pd.DataFrame, names: Sequence[str]) -> Optional[pd.Series]:
+        if frame is None or frame.empty:
+            return None
+        normalized = {str(idx).lower().replace(" ", ""): idx for idx in frame.index}
+        for name in names:
+            key = name.lower().replace(" ", "")
+            if key in normalized:
+                return pd.to_numeric(frame.loc[normalized[key]], errors="coerce").dropna()
+        return None
+
+    def _estimate_revisions(self, ticker: str, revenue_estimate: Optional[float],
+                            earnings_estimate: Optional[float]) -> Tuple[Optional[float], Optional[float]]:
+        """True estimate revisions versus the last stored snapshot, never growth proxies."""
+        today = str(datetime.now().date())
+        with sqlite3.connect(self.db_path) as conn:
+            prior = conn.execute("""SELECT revenue_estimate,earnings_estimate
+                FROM estimate_snapshots_v4 WHERE ticker=? AND snapshot_date<?
+                ORDER BY snapshot_date DESC LIMIT 1""", (ticker, today)).fetchone()
+            conn.execute("INSERT OR REPLACE INTO estimate_snapshots_v4 VALUES (?,?,?,?)",
+                         (ticker, today, revenue_estimate, earnings_estimate))
+        if not prior:
+            return None, None
+        old_revenue, old_earnings = prior
+        revenue_revision = ((revenue_estimate / abs(old_revenue) - np.sign(old_revenue)) * 100
+                            if revenue_estimate is not None and old_revenue not in (None, 0) else None)
+        earnings_revision = ((earnings_estimate / abs(old_earnings) - np.sign(old_earnings)) * 100
+                             if earnings_estimate is not None and old_earnings not in (None, 0) else None)
+        return revenue_revision, earnings_revision
+
+    def analyze(self, ticker: str, peer_universe: Optional[Sequence[str]] = None) -> FundamentalReport:
+        notes: List[str] = []
+        if not YFINANCE_OK:
+            return FundamentalReport(ticker, False, "Unknown", 50.0, "unknown",
+                None, None, None, None, None, None, None, None, None, None,
+                None, None, None, None, None, notes=["yfinance unavailable."])
+        info = self._info(ticker)
+        if not info:
+            return FundamentalReport(ticker, False, "Unknown", 50.0, "unknown",
+                None, None, None, None, None, None, None, None, None, None,
+                None, None, None, None, None, notes=["Fundamental source returned no data."])
+        sector = str(info.get("sector") or "Unknown")
+        pe = _safe_float(info.get("trailingPE"))
+        market_cap = _safe_float(info.get("marketCap"))
+        fcf = _safe_float(info.get("freeCashflow"))
+        ebitda = _safe_float(info.get("ebitda"))
+        total_debt = _safe_float(info.get("totalDebt")) or 0.0
+        cash = _safe_float(info.get("totalCash")) or 0.0
+        operating_cf = _safe_float(info.get("operatingCashflow"))
+        net_income = _safe_float(info.get("netIncomeToCommon"))
+        revenue_growth = _safe_float(info.get("revenueGrowth"))
+        earnings_growth = _safe_float(info.get("earningsGrowth"))
+        roic = _safe_float(info.get("returnOnInvestedCapital"))
+        beta = _safe_float(info.get("beta")) or 1.0
+        debt_to_equity = _safe_float(info.get("debtToEquity"))
+        tax_rate = _safe_float(info.get("effectiveTaxRate")) or 0.21
+        equity_weight = 1.0 / (1.0 + max(0.0, (debt_to_equity or 0.0) / 100.0))
+        debt_weight = 1.0 - equity_weight
+        cost_equity = SecureConfig.RISK_FREE_RATE + beta * 0.055
+        cost_debt = 0.055
+        wacc = equity_weight * cost_equity + debt_weight * cost_debt * (1 - tax_rate)
+
+        peer_pes = []
+        for peer in (peer_universe or []):
+            if peer.upper() == ticker.upper():
+                continue
+            pinfo = self._info(peer.upper())
+            ppe = _safe_float(pinfo.get("trailingPE"))
+            if pinfo.get("sector") == sector and ppe and 0 < ppe < 200:
+                peer_pes.append(ppe)
+        sector_median = float(np.median(peer_pes)) if len(peer_pes) >= 2 else None
+        if sector_median is None:
+            notes.append("Fewer than two same-sector portfolio peers; sector-relative P/E unavailable.")
+
+        historical_percentile = None
+        margin_trend = None
+        revenue_revision = earnings_revision = None
+        try:
+            ticker_obj = yf.Ticker(ticker)
+            q_income = ticker_obj.quarterly_income_stmt
+            revenue = self._statement_row(q_income, ("Total Revenue", "Operating Revenue"))
+            net_inc = self._statement_row(q_income, ("Net Income", "Net Income Common Stockholders"))
+            if revenue is not None and net_inc is not None and len(revenue) >= 2 and len(net_inc) >= 2:
+                common = revenue.index.intersection(net_inc.index)
+                margins = (net_inc[common] / revenue[common].replace(0, np.nan)).dropna()
+                margins.index = pd.to_datetime(margins.index)
+                margins = margins.sort_index()
+                if len(margins) >= 2:
+                    margin_trend = float((margins.iloc[-1] - margins.iloc[0]) * 100)
+            if roic is None:
+                balance = ticker_obj.quarterly_balance_sheet
+                ebit = self._statement_row(q_income, ("EBIT", "Operating Income"))
+                debt_row = self._statement_row(balance, ("Total Debt",))
+                equity_row = self._statement_row(balance, ("Stockholders Equity", "Total Equity Gross Minority Interest"))
+                cash_row = self._statement_row(balance, ("Cash Cash Equivalents And Short Term Investments",
+                                                           "Cash And Cash Equivalents"))
+                if ebit is not None and debt_row is not None and equity_row is not None:
+                    invested = float(debt_row.iloc[0] + equity_row.iloc[0] -
+                                     (cash_row.iloc[0] if cash_row is not None and len(cash_row) else 0))
+                    if invested > 0:
+                        roic = float(ebit.iloc[0] * 4 * (1 - tax_rate) / invested)
+            eps = self._statement_row(q_income, ("Diluted EPS", "Basic EPS"))
+            if eps is not None and len(eps) >= 4 and pe:
+                eps.index = pd.to_datetime(eps.index)
+                ttm_eps = eps.sort_index().rolling(4).sum().dropna()
+                history = ticker_obj.history(period="5y", auto_adjust=True)["Close"].dropna()
+                if history.index.tz is not None:
+                    history.index = history.index.tz_localize(None)
+                historical_pes = []
+                for statement_date, ttm_value in ttm_eps.items():
+                    available_price = history.loc[history.index <= pd.Timestamp(statement_date)]
+                    if len(available_price) and ttm_value > 0:
+                        historical_pes.append(float(available_price.iloc[-1] / ttm_value))
+                if len(historical_pes) >= 2:
+                    historical_percentile = float(np.mean(np.asarray(historical_pes) <= pe) * 100)
+            current_earnings_estimate = current_revenue_estimate = None
+            estimates = ticker_obj.earnings_estimate
+            if isinstance(estimates, pd.DataFrame) and not estimates.empty:
+                estimate_row = estimates.loc["+1y"] if "+1y" in estimates.index else estimates.iloc[0]
+                current_earnings_estimate = _safe_float(estimate_row.get("avg"))
+            revenue_estimates = ticker_obj.revenue_estimate
+            if isinstance(revenue_estimates, pd.DataFrame) and not revenue_estimates.empty:
+                estimate_row = (revenue_estimates.loc["+1y"] if "+1y" in revenue_estimates.index
+                                else revenue_estimates.iloc[0])
+                current_revenue_estimate = _safe_float(estimate_row.get("avg"))
+            revenue_revision, earnings_revision = self._estimate_revisions(
+                ticker, current_revenue_estimate, current_earnings_estimate)
+            if revenue_revision is None and earnings_revision is None:
+                notes.append("Estimate revision baseline stored; revisions appear after a later run/date.")
+        except Exception as exc:
+            notes.append(f"Statement history partially unavailable: {exc}")
+
+        fcf_yield = fcf / market_cap * 100 if fcf is not None and market_cap else None
+        net_debt_ebitda = (total_debt - cash) / ebitda if ebitda and ebitda > 0 else None
+        earnings_quality = operating_cf / net_income if operating_cf is not None and net_income and net_income > 0 else None
+        roic_wacc = roic * 100 - wacc * 100 if roic is not None else None
+        relative_pe = pe / sector_median if pe and sector_median else None
+
+        components: List[Tuple[Optional[float], float]] = []
+        components.append((None if relative_pe is None else _clip(100 - (relative_pe - 0.7) * 100, 0, 100), 0.14))
+        components.append((None if historical_percentile is None else 100 - historical_percentile, 0.10))
+        components.append((None if fcf_yield is None else _clip(45 + fcf_yield * 6, 0, 100), 0.13))
+        components.append((None if roic_wacc is None else _clip(50 + roic_wacc * 3, 0, 100), 0.15))
+        components.append((None if net_debt_ebitda is None else _clip(90 - max(0, net_debt_ebitda) * 18, 0, 100), 0.12))
+        components.append((None if earnings_quality is None else _clip(earnings_quality * 60, 0, 100), 0.12))
+        components.append((None if margin_trend is None else _clip(50 + margin_trend * 7, 0, 100), 0.10))
+        components.append((None if revenue_growth is None else _clip(50 + revenue_growth * 180, 0, 100), 0.07))
+        components.append((None if earnings_growth is None else _clip(50 + earnings_growth * 120, 0, 100), 0.07))
+        available_components = [(v, w) for v, w in components if v is not None]
+        score = (sum(v * w for v, w in available_components) /
+                 sum(w for _, w in available_components)) if available_components else 50.0
+        if relative_pe is not None:
+            valuation = "cheap" if relative_pe < 0.80 else "expensive" if relative_pe > 1.25 else "fair"
+        elif historical_percentile is not None:
+            valuation = "cheap" if historical_percentile < 25 else "expensive" if historical_percentile > 75 else "fair"
+        else:
+            valuation = "unknown"
+        return FundamentalReport(
+            ticker, True, sector, round(score, 2), valuation, pe,
+            round(sector_median, 2) if sector_median else None,
+            round(relative_pe, 3) if relative_pe is not None else None,
+            round(historical_percentile, 2) if historical_percentile is not None else None,
+            round(fcf_yield, 2) if fcf_yield is not None else None,
+            round(roic * 100, 2) if roic is not None else None, round(wacc * 100, 2),
+            round(roic_wacc, 2) if roic_wacc is not None else None,
+            round(net_debt_ebitda, 2) if net_debt_ebitda is not None else None,
+            round(earnings_quality, 2) if earnings_quality is not None else None,
+            round(margin_trend, 2) if margin_trend is not None else None,
+            round(revenue_growth * 100, 2) if revenue_growth is not None else None,
+            round(earnings_growth * 100, 2) if earnings_growth is not None else None,
+            round(revenue_revision, 2) if revenue_revision is not None else None,
+            round(earnings_revision, 2) if earnings_revision is not None else None, notes)
+
+
+@dataclass
+class EventReport:
+    ticker: str
+    event_risk_score: float
+    high_event_risk: bool
+    next_earnings_date: Optional[str]
+    next_dividend_date: Optional[str]
+    split_detected: bool
+    analyst_revision_count_30d: int
+    guidance_or_material_events: List[str]
+    macro_events: List[Dict[str, Any]]
+    position_size_multiplier: float
+    notes: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+class EventEngine:
+    MATERIAL_KEYWORDS = ("guidance", "forecast", "acquisition", "merger", "investigation",
+                         "lawsuit", "recall", "bankruptcy", "offering", "dividend", "split")
+    MACRO_KEYWORDS = ("federal reserve", "fomc", "consumer price index", "cpi",
+                      "employment situation", "nonfarm", "nfp", "ecb")
+
+    @staticmethod
+    def _days_to(value: Any) -> Optional[int]:
+        try:
+            ts = pd.Timestamp(value)
+            if ts.tzinfo is not None:
+                ts = ts.tz_localize(None)
+            return int((ts.normalize() - pd.Timestamp.now().normalize()).days)
+        except Exception:
+            return None
+
+    def _fred_macro_events(self, horizon_days: int = 21) -> List[Dict[str, Any]]:
+        if not (REQUESTS_OK and SecureConfig.FRED_API_KEY):
+            return []
+        today = datetime.now().date()
+        try:
+            response = requests.get("https://api.stlouisfed.org/fred/releases/dates", params={
+                "api_key": SecureConfig.FRED_API_KEY, "file_type": "json",
+                "realtime_start": str(today), "realtime_end": str(today + timedelta(days=horizon_days)),
+                "include_release_dates_with_no_data": "true", "limit": 1000}, timeout=15)
+            response.raise_for_status()
+            events = []
+            for item in response.json().get("release_dates", []):
+                name = str(item.get("release_name", ""))
+                if any(key in name.lower() for key in self.MACRO_KEYWORDS):
+                    events.append({"date": item.get("date"), "name": name})
+            return events
+        except Exception:
+            return []
+
+    def analyze(self, ticker: str) -> EventReport:
+        notes, material = [], []
+        earnings_date = dividend_date = None
+        split_detected, revisions = False, 0
+        risk = 0.0
+        if YFINANCE_OK:
+            try:
+                obj = yf.Ticker(ticker)
+                try:
+                    calendar = obj.calendar
+                    if isinstance(calendar, dict):
+                        raw = calendar.get("Earnings Date") or calendar.get("EarningsDate")
+                        if isinstance(raw, (list, tuple)) and raw:
+                            raw = raw[0]
+                        if raw is not None:
+                            earnings_date = str(pd.Timestamp(raw).date())
+                    days = self._days_to(earnings_date)
+                    if days is not None and 0 <= days <= 10:
+                        risk += max(15.0, 45.0 - days * 3.0)
+                except Exception:
+                    pass
+                info = obj.info or {}
+                ex_div = info.get("exDividendDate")
+                if ex_div:
+                    ex_div = pd.Timestamp(ex_div, unit="s") if isinstance(ex_div, (int, float)) else pd.Timestamp(ex_div)
+                    dividend_date = str(ex_div.date())
+                    days = self._days_to(ex_div)
+                    if days is not None and 0 <= days <= 7:
+                        risk += 8.0
+                try:
+                    actions = obj.actions
+                    if isinstance(actions, pd.DataFrame) and not actions.empty and "Stock Splits" in actions:
+                        recent = actions.loc[actions.index >= pd.Timestamp.now(tz=actions.index.tz) - pd.Timedelta(days=90)]
+                        split_detected = bool((recent["Stock Splits"] != 0).any())
+                        risk += 5.0 if split_detected else 0.0
+                except Exception:
+                    pass
+                try:
+                    changes = obj.upgrades_downgrades
+                    if isinstance(changes, pd.DataFrame) and not changes.empty:
+                        idx = pd.to_datetime(changes.index)
+                        if idx.tz is not None:
+                            idx = idx.tz_localize(None)
+                        revisions = int((idx >= pd.Timestamp.now() - pd.Timedelta(days=30)).sum())
+                        risk += min(12.0, revisions * 1.5)
+                except Exception:
+                    pass
+                try:
+                    for item in (obj.news or [])[:20]:
+                        content = item.get("content", item)
+                        title = str(content.get("title", ""))
+                        if title and any(key in title.lower() for key in self.MATERIAL_KEYWORDS):
+                            material.append(title[:180])
+                    risk += min(20.0, len(material) * 5.0)
+                except Exception:
+                    pass
+            except Exception as exc:
+                notes.append(f"Company event source failed: {exc}")
+        else:
+            notes.append("yfinance unavailable; company events not checked.")
+        macro = self._fred_macro_events()
+        for event in macro:
+            days = self._days_to(event.get("date"))
+            if days is not None and 0 <= days <= 7:
+                risk += max(4.0, 12.0 - days)
+        if not SecureConfig.FRED_API_KEY:
+            notes.append("FRED_API_KEY missing; CPI/NFP/central-bank release calendar not verified.")
+        risk = _clip(risk, 0, 100)
+        multiplier = 1.0 if risk < 35 else 0.70 if risk < 65 else 0.40
+        return EventReport(ticker, round(risk, 1), risk >= 65, earnings_date, dividend_date,
+                           split_detected, revisions, material, macro, multiplier, notes)
+
+
+@dataclass
+class OptimizationConstraints:
+    max_position: float = 0.25
+    max_sector: float = 0.45
+    max_turnover: float = 0.20
+    min_cash: float = 0.02
+    long_only: bool = True
+    position_caps: Dict[str, float] = field(default_factory=dict)
+
+
+@dataclass
+class OptimizationResult:
+    method: str
+    weights: Dict[str, float]
+    expected_return_pct: float
+    volatility_pct: float
+    sortino: float
+    one_way_turnover: float
+    success: bool
+    message: str
+    constraints: Dict[str, Any]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+class PortfolioOptimizer:
+    """Long-only optimizer with explicit cash, turnover and sector limits."""
+
+    def __init__(self, risk_free_rate: float = SecureConfig.RISK_FREE_RATE):
+        if not SCIPY_OK:
+            raise RuntimeError("scipy is required for portfolio optimization")
+        self.risk_free_rate = float(risk_free_rate)
+
+    @staticmethod
+    def _clean_returns(returns: pd.DataFrame) -> pd.DataFrame:
+        return returns.replace([np.inf, -np.inf], np.nan).dropna(how="all").fillna(0.0)
+
+    @staticmethod
+    def _turnover(weights: np.ndarray, tickers: Sequence[str],
+                  previous: Optional[Dict[str, float]], cash: float) -> float:
+        if not previous:
+            return 0.0
+        old = np.asarray([previous.get(t, 0.0) for t in tickers], dtype=float)
+        old_cash = float(previous.get("CASH", max(0.0, 1 - old.sum())))
+        return float((np.abs(weights - old).sum() + abs(cash - old_cash)) / 2)
+
+    @staticmethod
+    def _portfolio_stats(weights: np.ndarray, returns: pd.DataFrame,
+                         expected_annual: np.ndarray, risk_free: float) -> Tuple[float, float, float]:
+        daily = returns.values @ weights
+        expected = float(weights @ expected_annual)
+        volatility = float(np.std(daily, ddof=1) * math.sqrt(252)) if len(daily) > 1 else 0.0
+        downside = daily[daily < 0]
+        downside_dev = float(np.std(downside, ddof=1) * math.sqrt(252)) if len(downside) > 1 else 0.0
+        sortino = (expected - risk_free) / downside_dev if downside_dev > 1e-9 else 0.0
+        return expected, volatility, float(sortino)
+
+    @staticmethod
+    def _capped_allocation(values: np.ndarray, caps: np.ndarray, target: float) -> np.ndarray:
+        """Projects non-negative preferences onto a capped simplex."""
+        target = min(float(target), float(caps.sum()))
+        weights = np.maximum(np.asarray(values, dtype=float), 0)
+        if weights.sum() <= 1e-12:
+            weights = np.ones_like(weights)
+        weights = weights / weights.sum() * target
+        for _ in range(20):
+            over = weights > caps + 1e-12
+            if not over.any():
+                break
+            weights[over] = caps[over]
+            remaining = target - weights.sum()
+            free = ~over
+            room = np.maximum(0, caps[free] - weights[free])
+            if remaining <= 1e-12 or room.sum() <= 1e-12:
+                break
+            weights[free] += remaining * room / room.sum()
+        return np.minimum(weights, caps)
+
+    @staticmethod
+    def black_litterman_returns(covariance: np.ndarray, market_weights: np.ndarray,
+                                 views: np.ndarray, tau: float = 0.05,
+                                 risk_aversion: float = 2.5,
+                                 view_confidence: Optional[np.ndarray] = None) -> np.ndarray:
+        pi = risk_aversion * covariance @ market_weights
+        n = len(pi)
+        P = np.eye(n)
+        q = np.asarray(views, dtype=float)
+        confidence = np.asarray(view_confidence if view_confidence is not None else
+                                np.full(n, 0.55), dtype=float)
+        confidence = np.clip(confidence, 0.05, 0.99)
+        base_var = np.clip(np.diag(tau * covariance), 1e-8, None)
+        omega = np.diag(base_var * (1 - confidence) / confidence)
+        tau_cov_inv = np.linalg.pinv(tau * covariance)
+        middle = np.linalg.pinv(tau_cov_inv + P.T @ np.linalg.pinv(omega) @ P)
+        return middle @ (tau_cov_inv @ pi + P.T @ np.linalg.pinv(omega) @ q)
+
+    def optimize(self, returns: pd.DataFrame, method: str = "risk_parity",
+                 expected_returns: Optional[Dict[str, float]] = None,
+                 previous_weights: Optional[Dict[str, float]] = None,
+                 sectors: Optional[Dict[str, str]] = None,
+                 market_caps: Optional[Dict[str, float]] = None,
+                 view_confidence: Optional[Dict[str, float]] = None,
+                 constraints: Optional[OptimizationConstraints] = None,
+                 ppo_timesteps: int = 10_000) -> OptimizationResult:
+        constraints = constraints or OptimizationConstraints()
+        returns = self._clean_returns(returns)
+        tickers = list(returns.columns)
+        if not tickers or len(returns) < 30:
+            raise ValueError("At least 30 overlapping observations are required")
+        n = len(tickers)
+        sectors = sectors or {}
+        caps = np.asarray([min(constraints.max_position,
+                               constraints.position_caps.get(t, constraints.max_position))
+                           for t in tickers], dtype=float)
+        sector_capacity = 0.0
+        for sector in set(sectors.get(t, "Unknown") for t in tickers):
+            idx = [i for i, t in enumerate(tickers) if sectors.get(t, "Unknown") == sector]
+            sector_capacity += min(constraints.max_sector, float(caps[idx].sum()))
+        target_risk_sum = min(1.0 - constraints.min_cash, float(caps.sum()), sector_capacity)
+        if previous_weights:
+            previous_risky = sum(max(0.0, previous_weights.get(t, 0.0)) for t in tickers)
+            target_risk_sum = min(target_risk_sum, previous_risky + constraints.max_turnover)
+        covariance = returns.cov().values * 252
+        covariance += np.eye(n) * 1e-8
+        historical_mean = returns.mean().values * 252
+        expected = np.asarray([expected_returns.get(t, historical_mean[i]) if expected_returns else
+                               historical_mean[i] for i, t in enumerate(tickers)], dtype=float)
+
+        if method == "black_litterman":
+            caps = np.asarray([max(0.0, (market_caps or {}).get(t, 1.0)) for t in tickers])
+            caps = caps / caps.sum() if caps.sum() > 0 else np.full(n, 1 / n)
+            confidence = np.asarray([(view_confidence or {}).get(t, 0.55) for t in tickers])
+            expected = self.black_litterman_returns(covariance, caps, expected, view_confidence=confidence)
+        elif method == "ppo":
+            raw = self._optimize_ppo(returns, target_risk_sum, constraints.max_position, ppo_timesteps)
+            return self._finalize(method, raw, returns, expected, tickers, previous_weights,
+                                  sectors or {}, constraints, True, "Experimental PPO optimizer completed.")
+
+        initial = self._capped_allocation(np.ones(n), caps, target_risk_sum)
+        if previous_weights:
+            initial = np.asarray([max(0, previous_weights.get(t, 0)) for t in tickers])
+            initial = self._capped_allocation(initial, caps, target_risk_sum)
+
+        def risk_parity_objective(w: np.ndarray) -> float:
+            variance = float(w @ covariance @ w)
+            if variance <= 1e-12:
+                return 1e6
+            marginal = covariance @ w
+            contributions = w * marginal / variance
+            target = np.full(n, 1 / n)
+            return float(np.sum((contributions - target) ** 2))
+
+        def max_sortino_objective(w: np.ndarray) -> float:
+            daily = returns.values @ w
+            downside = daily[daily < 0]
+            down_dev = float(np.std(downside) * math.sqrt(252)) if len(downside) > 2 else 1e-6
+            return -float((w @ expected - self.risk_free_rate) / max(down_dev, 1e-6))
+
+        def mean_variance_objective(w: np.ndarray) -> float:
+            return float(2.5 * w @ covariance @ w / 2 - w @ expected)
+
+        objective = {"risk_parity": risk_parity_objective,
+                     "max_sortino": max_sortino_objective,
+                     "black_litterman": mean_variance_objective}.get(method)
+        if objective is None:
+            raise ValueError("method must be risk_parity, max_sortino, black_litterman or ppo")
+
+        scipy_constraints: List[Dict[str, Any]] = [{"type": "eq", "fun": lambda w: w.sum() - target_risk_sum}]
+        for sector in sorted(set(sectors.get(t, "Unknown") for t in tickers)):
+            indices = np.asarray([i for i, t in enumerate(tickers) if sectors.get(t, "Unknown") == sector])
+            scipy_constraints.append({"type": "ineq",
+                "fun": lambda w, idx=indices: constraints.max_sector - float(w[idx].sum())})
+        if previous_weights:
+            scipy_constraints.append({"type": "ineq", "fun": lambda w:
+                constraints.max_turnover - self._turnover(w, tickers, previous_weights, 1 - w.sum())})
+
+        result = minimize(objective, initial, method="SLSQP",
+                          bounds=[(0.0, float(cap)) for cap in caps],
+                          constraints=scipy_constraints,
+                          options={"maxiter": 700, "ftol": 1e-10, "disp": False})
+        raw = np.asarray(result.x if result.success else initial, dtype=float)
+        return self._finalize(method, raw, returns, expected, tickers, previous_weights,
+                              sectors, constraints, bool(result.success), str(result.message))
+
+    def _finalize(self, method: str, risky: np.ndarray, returns: pd.DataFrame,
+                  expected: np.ndarray, tickers: Sequence[str], previous: Optional[Dict[str, float]],
+                  sectors: Dict[str, str], constraints: OptimizationConstraints,
+                  success: bool, message: str) -> OptimizationResult:
+        risky = np.clip(np.asarray(risky, dtype=float), 0, constraints.max_position)
+        caps = np.asarray([min(constraints.max_position,
+                               constraints.position_caps.get(t, constraints.max_position))
+                           for t in tickers], dtype=float)
+        sector_capacity = 0.0
+        for sector in set(sectors.get(t, "Unknown") for t in tickers):
+            idx = [i for i, t in enumerate(tickers) if sectors.get(t, "Unknown") == sector]
+            sector_capacity += min(constraints.max_sector, float(caps[idx].sum()))
+        target = min(1 - constraints.min_cash, float(caps.sum()), sector_capacity,
+                     float(np.maximum(risky, 0).sum()))
+        risky = self._capped_allocation(risky, caps, target)
+        # Final safety projection: even an SLSQP failure may never leak a
+        # position or sector violation into the returned portfolio.
+        for sector in set(sectors.get(t, "Unknown") for t in tickers):
+            idx = np.asarray([i for i, t in enumerate(tickers)
+                              if sectors.get(t, "Unknown") == sector])
+            sector_weight = float(risky[idx].sum())
+            if sector_weight > constraints.max_sector + 1e-12:
+                risky[idx] *= constraints.max_sector / sector_weight
+        cash = max(0.0, 1 - risky.sum())
+        weights = {t: round(float(w), 6) for t, w in zip(tickers, risky)}
+        weights["CASH"] = round(cash, 6)
+        exp_ret, vol, sortino = self._portfolio_stats(risky, returns, expected, self.risk_free_rate)
+        turnover = self._turnover(risky, tickers, previous, cash)
+        return OptimizationResult(method, weights, round(exp_ret * 100, 3), round(vol * 100, 3),
+                                  round(sortino, 3), round(turnover, 5), success, message,
+                                  asdict(constraints))
+
+    @staticmethod
+    def _optimize_ppo(returns: pd.DataFrame, target_sum: float, max_position: float,
+                      timesteps: int) -> np.ndarray:
+        if not (_ensure_package("stable_baselines3", "stable-baselines3") and
+                _ensure_package("gymnasium")):
+            raise RuntimeError("PPO requested but stable-baselines3/gymnasium are unavailable")
+        import gymnasium as gym
+        from gymnasium import spaces
+        from stable_baselines3 import PPO
+
+        values = returns.values.astype(np.float32)
+        n_assets = values.shape[1]
+
+        class PortfolioEnv(gym.Env):
+            metadata = {"render_modes": []}
+
+            def __init__(self):
+                super().__init__()
+                self.action_space = spaces.Box(0, 1, (n_assets,), dtype=np.float32)
+                self.observation_space = spaces.Box(-np.inf, np.inf, (n_assets * 3,), dtype=np.float32)
+                self.index = 20
+
+            def _observation(self):
+                window = values[self.index - 20:self.index]
+                return np.concatenate([window.mean(0), window.std(0), values[self.index - 1]]).astype(np.float32)
+
+            def reset(self, seed=None, options=None):
+                super().reset(seed=seed)
+                self.index = 20
+                return self._observation(), {}
+
+            def step(self, action):
+                weights = np.maximum(action, 0)
+                weights = weights / max(weights.sum(), 1e-9)
+                weights = np.minimum(weights, max_position)
+                weights = weights / max(weights.sum(), 1e-9) * target_sum
+                reward = float(values[self.index] @ weights - 0.5 * np.std(values[self.index - 20:self.index] @ weights))
+                self.index += 1
+                terminated = self.index >= len(values) - 1
+                return self._observation() if not terminated else np.zeros(n_assets * 3, np.float32), reward, terminated, False, {}
+
+        env = PortfolioEnv()
+        model = PPO("MlpPolicy", env, verbose=0, seed=42)
+        model.learn(total_timesteps=int(timesteps))
+        observation, _ = env.reset()
+        action, _ = model.predict(observation, deterministic=True)
+        action = np.maximum(action, 0)
+        action = action / max(action.sum(), 1e-9)
+        action = np.minimum(action, max_position)
+        return action / max(action.sum(), 1e-9) * target_sum
+
+
+@dataclass
+class DigitalTwinReport:
+    weights: Dict[str, float]
+    horizon_days: int
+    simulations: int
+    expected_return_pct: float
+    p10_return_pct: float
+    p90_return_pct: float
+    probability_drawdown_over_10pct: float
+    var_95_pct: float
+    cvar_95_pct: float
+    concentration_hhi: float
+    notes: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+class PortfolioDigitalTwin:
+    def simulate(self, returns: pd.DataFrame, weights: Dict[str, float],
+                 horizon_days: int = SecureConfig.MC_HORIZON,
+                 simulations: int = SecureConfig.MC_SIMULATIONS,
+                 seed: int = 42) -> DigitalTwinReport:
+        returns = returns.dropna(how="all").fillna(0.0)
+        tickers = list(returns.columns)
+        w = np.asarray([weights.get(t, 0.0) for t in tickers], dtype=float)
+        notes = []
+        if len(returns) < 30:
+            return DigitalTwinReport(weights, horizon_days, 0, 0, 0, 0, 0, 0, 0,
+                                     float(np.sum(w ** 2)), ["Insufficient history for Digital Twin."])
+        rng = np.random.default_rng(seed)
+        history = returns.values
+        block, paths = 5, np.zeros((simulations, horizon_days))
+        blocks_needed = math.ceil(horizon_days / block)
+        for simulation in range(simulations):
+            chunks = []
+            for _ in range(blocks_needed):
+                start = int(rng.integers(0, max(1, len(history) - block + 1)))
+                chunks.append(history[start:start + block] @ w)
+            paths[simulation] = np.concatenate(chunks)[:horizon_days]
+        cumulative = np.cumprod(1 + paths, axis=1)
+        final = cumulative[:, -1] - 1
+        max_drawdown = (cumulative / np.maximum.accumulate(cumulative, axis=1) - 1).min(axis=1)
+        var95 = float(np.percentile(final, 5))
+        tail = final[final <= var95]
+        risky_total = float(w.sum())
+        if risky_total < 0.999:
+            notes.append(f"Cash bucket {weights.get('CASH', 0):.1%} included at zero return.")
+        return DigitalTwinReport(
+            weights, horizon_days, simulations, round(float(np.mean(final)) * 100, 3),
+            round(float(np.percentile(final, 10)) * 100, 3),
+            round(float(np.percentile(final, 90)) * 100, 3),
+            round(float(np.mean(max_drawdown <= -0.10)) * 100, 2), round(var95 * 100, 3),
+            round(float(tail.mean() if len(tail) else var95) * 100, 3),
+            round(float(np.sum(w ** 2)), 5), notes)
+
+
+@dataclass
+class TwinOptimizationResult:
+    optimization: OptimizationResult
+    digital_twin: DigitalTwinReport
+    iterations: int
+    adjustments: List[str]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+def optimize_with_digital_twin(
+        optimizer: PortfolioOptimizer, twin: PortfolioDigitalTwin, returns: pd.DataFrame,
+        method: str, expected_returns: Dict[str, float], previous_weights: Optional[Dict[str, float]],
+        sectors: Dict[str, str], market_caps: Dict[str, float], view_confidence: Dict[str, float],
+        constraints: OptimizationConstraints, max_drawdown_probability: float = 25.0,
+        max_iterations: int = 4) -> TwinOptimizationResult:
+    current = OptimizationConstraints(**asdict(constraints))
+    adjustments: List[str] = []
+    opt: Optional[OptimizationResult] = None
+    simulation: Optional[DigitalTwinReport] = None
+    for iteration in range(1, max_iterations + 1):
+        opt = optimizer.optimize(returns, method, expected_returns, previous_weights,
+                                 sectors, market_caps, view_confidence, current)
+        simulation = twin.simulate(returns, opt.weights)
+        if simulation.probability_drawdown_over_10pct <= max_drawdown_probability:
+            break
+        old_cash = current.min_cash
+        current.min_cash = min(0.60, current.min_cash + 0.10)
+        current.max_position = max(0.08, current.max_position * 0.85)
+        current.max_sector = max(0.25, current.max_sector * 0.90)
+        adjustments.append(
+            f"Iteration {iteration}: P(DD>10%)={simulation.probability_drawdown_over_10pct:.1f}% "
+            f"> {max_drawdown_probability:.1f}%; cash floor {old_cash:.0%}->{current.min_cash:.0%}, "
+            f"position/sector caps tightened.")
+    assert opt is not None and simulation is not None
+    return TwinOptimizationResult(opt, simulation, iteration, adjustments)
+
+
+@dataclass
+class StopLossEvent:
+    date: str
+    ticker: str
+    price: float
+    high_water_mark: float
+    threshold_pct: float
+    sold_weight: float
+    cost_pct: float
+
+
+@dataclass
+class BacktestResult:
+    start_date: str
+    end_date: str
+    total_return_pct: float
+    annual_return_pct: float
+    annual_volatility_pct: float
+    sharpe: float
+    sortino: float
+    max_drawdown_pct: float
+    total_turnover: float
+    total_cost_pct: float
+    rebalance_count: int
+    stop_loss_count: int
+    final_cash_weight: float
+    stop_loss_events: List[StopLossEvent]
+    equity_curve: Dict[str, float]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+class StrategyBacktester:
+    """Execution-aware portfolio backtest; intentionally separate from model WF."""
+
+    def run(self, prices: pd.DataFrame,
+            weight_provider: Callable[[pd.DataFrame, Dict[str, float]], Dict[str, float]],
+            rebalance_days: int = 21, warmup_days: int = 252,
+            commission_pct: float = 0.001, slippage_pct: float = 0.0005,
+            max_rebalance_turnover: float = 0.20,
+            use_trailing_stop: bool = True, volatility_window: int = 20,
+            stop_vol_multiplier: float = 1.25, min_stop: float = 0.06,
+            max_stop: float = 0.25) -> BacktestResult:
+        prices = prices.sort_index().dropna(how="all").ffill().dropna()
+        if len(prices) <= warmup_days + 30:
+            raise ValueError("Not enough aligned price history for strategy backtest")
+        tickers = list(prices.columns)
+        returns = prices.pct_change().fillna(0.0)
+        risky = np.zeros(len(tickers), dtype=float)
+        cash = 1.0
+        high_water = prices.iloc[warmup_days].values.astype(float)
+        active = np.zeros(len(tickers), dtype=bool)
+        wealth, total_turnover, total_cost = 1.0, 0.0, 0.0
+        daily_results, events, rebalances = [], [], 0
+        cost_rate = commission_pct + slippage_pct
+
+        for i in range(warmup_days, len(prices)):
+            date = prices.index[i]
+            day_ret = returns.iloc[i].values.astype(float)
+            pnl = float(risky @ day_ret)
+            wealth *= max(1e-9, 1 + pnl)
+            gross = risky * (1 + day_ret)
+            denominator = gross.sum() + cash
+            if denominator > 0:
+                risky, cash = gross / denominator, cash / denominator
+
+            current_prices = prices.iloc[i].values.astype(float)
+            high_water[active] = np.maximum(high_water[active], current_prices[active])
+            if use_trailing_stop and i > volatility_window:
+                vol = returns.iloc[i - volatility_window:i].std().values * math.sqrt(252)
+                thresholds = np.clip(stop_vol_multiplier * vol, min_stop, max_stop)
+                breached = active & (current_prices <= high_water * (1 - thresholds))
+                for idx in np.flatnonzero(breached):
+                    sold = float(risky[idx])
+                    cost = sold * cost_rate
+                    wealth *= max(1e-9, 1 - cost)
+                    total_cost += cost
+                    cash += sold
+                    risky[idx] = 0.0
+                    active[idx] = False
+                    events.append(StopLossEvent(str(date.date()), tickers[idx],
+                        round(float(current_prices[idx]), 4), round(float(high_water[idx]), 4),
+                        round(float(thresholds[idx] * 100), 2), round(sold, 6), round(cost * 100, 5)))
+
+            if (i - warmup_days) % rebalance_days == 0:
+                history = prices.iloc[:i + 1].copy()  # strict history-only provider
+                requested = weight_provider(history, {**{t: float(w) for t, w in zip(tickers, risky)},
+                                                       "CASH": float(cash)})
+                target = np.asarray([max(0.0, requested.get(t, 0.0)) for t in tickers])
+                target_cash = max(0.0, requested.get("CASH", 1 - target.sum()))
+                total = target.sum() + target_cash
+                target, target_cash = target / max(total, 1e-12), target_cash / max(total, 1e-12)
+                raw_turnover = float((np.abs(target - risky).sum() + abs(target_cash - cash)) / 2)
+                if raw_turnover > max_rebalance_turnover:
+                    scale = max_rebalance_turnover / raw_turnover
+                    target = risky + (target - risky) * scale
+                    target_cash = cash + (target_cash - cash) * scale
+                    raw_turnover = max_rebalance_turnover
+                rebalance_cost = raw_turnover * 2 * cost_rate
+                wealth *= max(1e-9, 1 - rebalance_cost)
+                total_turnover += raw_turnover
+                total_cost += rebalance_cost
+                risky, cash = target, target_cash
+                active = risky > 1e-8
+                high_water = current_prices.copy()
+                rebalances += 1
+            daily_results.append((date, wealth))
+
+        curve = pd.Series({date: value for date, value in daily_results}).sort_index()
+        daily_curve_returns = curve.pct_change().dropna()
+        years = max((curve.index[-1] - curve.index[0]).days / 365.25, 1 / 252)
+        annual_return = float(curve.iloc[-1] ** (1 / years) - 1)
+        annual_vol = float(daily_curve_returns.std() * math.sqrt(252))
+        rf_daily = SecureConfig.RISK_FREE_RATE / 252
+        sharpe = float((daily_curve_returns.mean() - rf_daily) / daily_curve_returns.std() * math.sqrt(252)) \
+            if daily_curve_returns.std() > 1e-12 else 0.0
+        downside = daily_curve_returns[daily_curve_returns < 0]
+        sortino = float((daily_curve_returns.mean() - rf_daily) / downside.std() * math.sqrt(252)) \
+            if len(downside) > 1 and downside.std() > 1e-12 else 0.0
+        drawdown = curve / curve.cummax() - 1
+        sampled = curve.iloc[::max(1, len(curve) // 500)]
+        return BacktestResult(str(curve.index[0].date()), str(curve.index[-1].date()),
+            round((curve.iloc[-1] - 1) * 100, 3), round(annual_return * 100, 3),
+            round(annual_vol * 100, 3), round(sharpe, 3), round(sortino, 3),
+            round(float(drawdown.min()) * 100, 3), round(total_turnover, 5),
+            round(total_cost * 100, 5), rebalances, len(events), round(float(cash), 5),
+            events, {str(k.date()): round(float(v), 6) for k, v in sampled.items()})
+
+
+@dataclass
+class MacroReport:
+    macro_score: float
+    source: str
+    indicators: Dict[str, Any]
+    notes: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+class MacroEngine:
+    def _fred_series(self, series_id: str) -> pd.Series:
+        if not (REQUESTS_OK and SecureConfig.FRED_API_KEY):
+            return pd.Series(dtype=float)
+        try:
+            response = requests.get("https://api.stlouisfed.org/fred/series/observations", params={
+                "api_key": SecureConfig.FRED_API_KEY, "file_type": "json",
+                "series_id": series_id, "sort_order": "desc", "limit": 18}, timeout=12)
+            response.raise_for_status()
+            rows = response.json().get("observations", [])
+            result = pd.Series({_item["date"]: _safe_float(_item.get("value")) for _item in rows})
+            return pd.to_numeric(result, errors="coerce").dropna().sort_index()
+        except Exception:
+            return pd.Series(dtype=float)
+
+    def analyze(self) -> MacroReport:
+        score, indicators, notes, sources = 0.0, {}, [], []
+        if SecureConfig.FRED_API_KEY:
+            fed_funds, cpi, unemployment = (self._fred_series(s) for s in ("DFF", "CPIAUCSL", "UNRATE"))
+            if len(fed_funds) >= 2:
+                rate_change = float(fed_funds.iloc[-1] - fed_funds.iloc[0])
+                indicators["fed_funds_change"] = round(rate_change, 3)
+                score += _clip(-rate_change * 18, -25, 25)
+            if len(cpi) >= 13:
+                inflation = float(cpi.iloc[-1] / cpi.iloc[-13] - 1) * 100
+                prior = float(cpi.iloc[-2] / cpi.iloc[-14] - 1) * 100 if len(cpi) >= 14 else inflation
+                indicators["cpi_yoy_pct"] = round(inflation, 2)
+                score += _clip((prior - inflation) * 8, -20, 20)
+            if len(unemployment) >= 4:
+                u_change = float(unemployment.iloc[-1] - unemployment.iloc[-4])
+                indicators["unemployment_3m_change"] = round(u_change, 2)
+                score += _clip(-u_change * 20, -20, 20)
+            if indicators:
+                sources.append("FRED")
+        elif not SecureConfig.FRED_API_KEY:
+            notes.append("FRED_API_KEY missing; macro score uses market proxies only.")
+        if YFINANCE_OK:
+            for ticker, label, sign in (("SPY", "equity_3m", 1), ("TLT", "bonds_3m", 0.4),
+                                         ("GLD", "gold_3m", -0.25), ("^VIX", "vix_3m", -0.6)):
+                try:
+                    frame = yf.download(ticker, period="6mo", auto_adjust=True, progress=False, threads=False)
+                    if isinstance(frame.columns, pd.MultiIndex):
+                        frame.columns = [c[0] for c in frame.columns]
+                    change = float(frame["Close"].dropna().iloc[-1] / frame["Close"].dropna().iloc[-64] - 1)
+                    indicators[label] = round(change * 100, 2)
+                    score += _clip(sign * change * 90, -18, 18)
+                except Exception:
+                    continue
+            if any(key.endswith("_3m") for key in indicators):
+                sources.append("market-proxies")
+        return MacroReport(round(_clip(score, -100, 100), 2), "+".join(sources) or "unavailable",
+                           indicators, notes)
+
+
+@dataclass
+class RecommendationGates:
+    recommendation_allowed: bool
+    directional_trade_allowed: bool
+    allocation_multiplier: float
+    reasons: List[str]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+def apply_recommendation_gates(integrity: DataIntegrityReport, validation: ValidationReport,
+                               confidence: PredictionConfidence21, event: EventReport,
+                               current_regime: str) -> RecommendationGates:
+    allowed, directional, multiplier, reasons = True, True, 1.0, []
+    if integrity.status == DataStatus.INVALID or integrity.confidence_score < 60:
+        allowed, directional = False, False
+        multiplier = 0.0
+        reasons.append("Data Confidence < 60 or data status INVALID: no recommendation.")
+    accuracy = validation.overall_directional_accuracy
+    if not np.isfinite(accuracy) or accuracy < 0.47:
+        directional = False
+        multiplier = min(multiplier, 0.25)
+        reasons.append("Walk-forward accuracy < 47%: no directional trade.")
+    if confidence.model_agreement == "Low":
+        multiplier *= 0.5
+        reasons.append("Low model agreement: maximum half position.")
+    if validation.degrading:
+        multiplier *= 0.65
+        reasons.append("Ensemble degradation: allocation reduced; severe per-model weights are near zero.")
+    if event.event_risk_score >= 35:
+        multiplier *= event.position_size_multiplier
+        reasons.append(f"Event risk {event.event_risk_score:.0f}/100: allocation reduced.")
+    if current_regime == "crisis":
+        multiplier *= 0.5
+        reasons.append("Crisis regime: stricter exposure cap.")
+    return RecommendationGates(allowed, directional, round(_clip(multiplier, 0, 1), 4), reasons)
+
+
+@dataclass
+class CommitteeScores:
+    alpha_score: float
+    risk_score: float
+    macro_score: float
+    fundamental_score: float
+    event_risk: float
+    cio_score: float
+    decision: str
+
+
+@dataclass
+class InvestmentMemo:
+    ticker: str
+    scores: CommitteeScores
+    conviction_score: float
+    suggested_allocation_range_pct: Tuple[float, float]
+    bull_case: str
+    base_case: str
+    bear_case: str
+    catalysts: List[str]
+    risks: List[str]
+    thesis_invalidators: List[str]
+    explanation_source: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        result = asdict(self)
+        result["suggested_allocation_range_pct"] = list(self.suggested_allocation_range_pct)
+        return result
+
+
+class InvestmentCommittee:
+    """All scores and decisions are deterministic; an LLM may explain only."""
+
+    @staticmethod
+    def _scores(prediction: PredictionConfidence21, fundamental: FundamentalReport,
+                macro: MacroReport, event: EventReport, integrity: DataIntegrityReport,
+                gates: RecommendationGates) -> CommitteeScores:
+        uncertainty = max(prediction.bootstrap_uncertainty_pct, prediction.ensemble_uncertainty_pct, 0.2)
+        signal_strength = math.tanh(prediction.expected_return_pct / uncertainty)
+        direction_sign = 1 if prediction.expected_return_pct >= 0 else -1
+        alpha = direction_sign * abs(signal_strength) * prediction.direction_probability_pct
+        risk = (100 - integrity.confidence_score) * 0.35 + event.event_risk_score * 0.30
+        risk += prediction.model_drift_penalty + prediction.concentration_penalty
+        risk += 18 if prediction.model_agreement == "Low" else 0
+        risk = _clip(risk, 0, 100)
+        fundamental_centered = (fundamental.fundamental_score - 50) * 2
+        cio = 0.45 * alpha + 0.20 * macro.macro_score + 0.20 * fundamental_centered - 0.25 * risk
+        cio = _clip(cio, -100, 100)
+        if not gates.recommendation_allowed:
+            decision = "NO_RECOMMENDATION"
+        elif not gates.directional_trade_allowed:
+            decision = "NO_DIRECTIONAL_TRADE"
+        elif cio >= 20:
+            decision = "BUY"
+        elif cio <= -20:
+            decision = "REDUCE_OR_AVOID"
+        else:
+            decision = "HOLD"
+        return CommitteeScores(round(alpha, 2), round(risk, 2), macro.macro_score,
+                               fundamental.fundamental_score, event.event_risk_score,
+                               round(cio, 2), decision)
+
+    @staticmethod
+    def _deterministic_explanation(ticker: str, scores: CommitteeScores,
+                                   prediction: PredictionConfidence21,
+                                   fundamental: FundamentalReport,
+                                   gates: RecommendationGates) -> Tuple[str, str, str]:
+        bull = (f"{ticker}: upside case requires the {prediction.expected_return_pct:+.2f}% model signal "
+                f"to hold with {prediction.model_agreement.lower()} agreement and fundamentals at "
+                f"{fundamental.fundamental_score:.0f}/100.")
+        base = (f"Deterministic CIO decision: {scores.decision}; CIO {scores.cio_score:+.0f}, "
+                f"Alpha {scores.alpha_score:+.0f}, Risk {scores.risk_score:.0f}, "
+                f"Macro {scores.macro_score:+.0f}, Event {scores.event_risk:.0f}.")
+        gate_text = "; ".join(gates.reasons) or "No hard gate is active."
+        bear = (f"Downside case reaches the calibrated lower interval near "
+                f"{prediction.interval_low_pct:+.2f}%. Gates: {gate_text}")
+        return bull, base, bear
+
+    @staticmethod
+    def _llm_explanation(structured: Dict[str, Any]) -> Optional[Tuple[str, str, str]]:
+        if not (REQUESTS_OK and SecureConfig.OPENAI_API_KEY):
+            return None
+        prompt = ("Explain the deterministic investment decision in the supplied JSON. Do not alter the "
+                  "decision or scores and do not add facts. Return JSON with exactly bull_case, base_case, "
+                  "bear_case.\n" + json.dumps(structured, default=_jsonable))
+        try:
+            response = requests.post("https://api.openai.com/v1/responses", headers={
+                "Authorization": f"Bearer {SecureConfig.OPENAI_API_KEY}",
+                "Content-Type": "application/json"}, json={
+                "model": os.getenv("SMARTINVEST_OPENAI_MODEL", "gpt-4o-mini"),
+                "input": prompt, "temperature": 0.2}, timeout=25)
+            response.raise_for_status()
+            data = response.json()
+            text = data.get("output_text")
+            if not text:
+                chunks = [part.get("text", "") for item in data.get("output", [])
+                          for part in item.get("content", []) if part.get("type") == "output_text"]
+                text = "".join(chunks)
+            parsed = json.loads(text.strip().strip("`"))
+            return parsed["bull_case"], parsed["base_case"], parsed["bear_case"]
+        except Exception:
+            return None
+
+    def deliberate(self, ticker: str, prediction: PredictionConfidence21,
+                   fundamental: FundamentalReport, macro: MacroReport, event: EventReport,
+                   integrity: DataIntegrityReport, gates: RecommendationGates,
+                   max_position: float, use_llm: bool = False) -> InvestmentMemo:
+        scores = self._scores(prediction, fundamental, macro, event, integrity, gates)
+        bull, base, bear = self._deterministic_explanation(ticker, scores, prediction, fundamental, gates)
+        source = "deterministic"
+        structured = {"ticker": ticker, "scores": asdict(scores), "prediction": prediction.to_dict(),
+                      "fundamental": fundamental.to_dict(), "macro": macro.to_dict(),
+                      "event": event.to_dict(), "gates": gates.to_dict()}
+        if use_llm:
+            explained = self._llm_explanation(structured)
+            if explained:
+                bull, base, bear = explained
+                source = "LLM explanation of deterministic scores"
+        maximum = max_position * gates.allocation_multiplier * prediction.conviction_score / 100
+        if scores.decision in ("NO_RECOMMENDATION", "NO_DIRECTIONAL_TRADE", "REDUCE_OR_AVOID"):
+            maximum = 0.0
+        catalysts = [f"Fundamental score {fundamental.fundamental_score:.0f}/100",
+                     f"Macro score {macro.macro_score:+.0f}/100"]
+        risks = gates.reasons + event.guidance_or_material_events[:3]
+        invalidators = ["Data Confidence falls below 60", "OOS hit rate falls below 47%",
+                        "Severe per-model drift or calibration breakdown",
+                        "Material event moves the thesis outside the calibrated interval"]
+        return InvestmentMemo(ticker, scores, prediction.conviction_score,
+                              (round(maximum * 0.4 * 100, 2), round(maximum * 100, 2)),
+                              bull, base, bear, catalysts, risks, invalidators, source)
+
+
+class SmartInvest51Beta4:
+    def __init__(self, use_llm: bool = False):
+        self.data = DataIntegrityEngine()
+        self.governance = ModelGovernance()
+        self.fundamentals = FundamentalEngine()
+        self.events = EventEngine()
+        self.macro = MacroEngine()
+        self.committee = InvestmentCommittee()
+        self.optimizer = PortfolioOptimizer() if SCIPY_OK else None
+        self.twin = PortfolioDigitalTwin()
+        self.backtester = StrategyBacktester()
+        self.use_llm = use_llm
+
+    def analyze_ticker(self, ticker: str, peer_universe: Sequence[str], macro: MacroReport,
+                       portfolio_weight: float = 0.0, horizon: int = 5,
+                       base_max_position: float = 0.25) -> Dict[str, Any]:
+        log(f"{ticker}: data integrity")
+        prices, integrity = self.data.fetch(ticker)
+        if prices is None or integrity.status == DataStatus.INVALID:
+            return {"ticker": ticker, "actionable": False, "integrity": integrity.to_dict(),
+                    "gate_reasons": ["Invalid market data: no recommendation."]}
+        features, regimes = build_features(prices, horizon), label_regime(prices)
+        current_regime = str(regimes.iloc[-1])
+        log(f"{ticker}: per-model walk-forward validation")
+        validation = walk_forward_validate(features, regimes, ticker, horizon=horizon)
+        self.governance.log_fold_results(ticker, validation)
+        clean = features.dropna()
+        feature_cols = [c for c in clean if c != "target_fwd_ret"]
+        if not validation.folds or len(clean) < 180:
+            return {"ticker": ticker, "actionable": False, "integrity": integrity.to_dict(),
+                    "validation": validation.to_dict(),
+                    "gate_reasons": ["Insufficient walk-forward evidence: no recommendation."]}
+        ensemble = ModelEnsemble().fit(clean[feature_cols], clean["target_fwd_ret"])
+        dynamic_weights, weight_components = self.governance.dynamic_weights(ticker, validation,
+                                                                              current_regime)
+        ensemble.set_weights(dynamic_weights)
+        prediction_batch = features.loc[features.index > clean.index[-1], feature_cols].ffill().fillna(0.0)
+        if prediction_batch.empty:
+            prediction_batch = features[feature_cols].iloc[[-1]].ffill().fillna(0.0)
+        blended_array, all_arrays = ensemble.predict(prediction_batch)
+        blended = float(blended_array[-1])
+        individual = {name: float(values[-1]) for name, values in all_arrays.items()}
+        fundamental = self.fundamentals.analyze(ticker, peer_universe)
+        event = self.events.analyze(ticker)
+        confidence = compute_prediction_confidence_21(
+            ticker, blended, individual, validation, current_regime, regimes,
+            integrity.confidence_score, integrity.source_disagreement,
+            event.event_risk_score, portfolio_weight)
+        gates = apply_recommendation_gates(integrity, validation, confidence, event, current_regime)
+        memo = self.committee.deliberate(ticker, confidence, fundamental, macro, event,
+                                         integrity, gates, base_max_position, self.use_llm)
+        return {"ticker": ticker, "actionable": gates.recommendation_allowed,
+                "directional_trade_allowed": gates.directional_trade_allowed,
+                "regime": current_regime, "integrity": integrity.to_dict(),
+                "validation": validation.to_dict(), "model_predictions": individual,
+                "ensemble_weights": ensemble.weights, "weight_components": weight_components,
+                "prediction": confidence.to_dict(), "fundamentals": fundamental.to_dict(),
+                "macro": macro.to_dict(), "event": event.to_dict(), "gates": gates.to_dict(),
+                "memo": memo.to_dict(), "_prices": prices, "_forecast": blended}
+
+    def run(self, tickers: Sequence[str], current_weights: Optional[Dict[str, float]] = None,
+            optimizer_method: str = "black_litterman", horizon: int = 5,
+            max_position: float = 0.25, max_sector: float = 0.45,
+            max_turnover: float = 0.20, min_cash: float = 0.02,
+            twin_drawdown_probability_limit: float = 25.0,
+            run_strategy_backtest: bool = True, backtest_method: str = "risk_parity",
+            output_json: Optional[str] = "smartinvest_beta4_report.json") -> Dict[str, Any]:
+        tickers = list(dict.fromkeys(t.upper().strip() for t in tickers if t.strip()))
+        if not tickers:
+            raise ValueError("At least one ticker is required")
+        current_weights = {str(k).upper(): max(0.0, float(v))
+                           for k, v in (current_weights or {}).items()}
+        current_total = sum(current_weights.values())
+        if current_weights and "CASH" not in current_weights and current_total < 1.0:
+            current_weights["CASH"] = 1.0 - current_total
+            current_total = 1.0
+        if current_total > 0:
+            current_weights = {k: v / current_total for k, v in current_weights.items()}
+        macro = self.macro.analyze()
+        results = []
+        for ticker in tickers:
+            try:
+                results.append(self.analyze_ticker(ticker, tickers, macro,
+                    current_weights.get(ticker, 0.0), horizon, max_position))
+            except Exception as exc:
+                log(f"{ticker}: {exc}", "ERROR")
+                traceback.print_exc()
+                results.append({"ticker": ticker, "actionable": False,
+                                "error": str(exc), "gate_reasons": ["Pipeline error"]})
+
+        eligible = [r for r in results if r.get("actionable") and r.get("directional_trade_allowed")]
+        portfolio_result = backtest_result = None
+        if self.optimizer and eligible:
+            price_frame = pd.concat({r["ticker"]: r["_prices"]["Close"] for r in eligible}, axis=1).dropna()
+            return_frame = price_frame.pct_change().dropna()
+            expected = {r["ticker"]: _clip((1 + _clip(r["_forecast"], -0.50, 0.50)) **
+                                            (252 / horizon) - 1, -0.60, 1.20)
+                        for r in eligible}
+            sectors = {r["ticker"]: (r["fundamentals"]["sector"]
+                       if r["fundamentals"]["sector"] != "Unknown" else f"Unknown:{r['ticker']}")
+                       for r in eligible}
+            market_caps = {}
+            for r in eligible:
+                try:
+                    market_caps[r["ticker"]] = float(self.fundamentals._info(r["ticker"]).get("marketCap") or 1)
+                except Exception:
+                    market_caps[r["ticker"]] = 1.0
+            view_confidence = {r["ticker"]: r["prediction"]["conviction_score"] / 100 for r in eligible}
+            position_caps = {r["ticker"]: max_position * r["gates"]["allocation_multiplier"]
+                             for r in eligible}
+            crisis = any(r["regime"] == "crisis" for r in eligible)
+            constraints = OptimizationConstraints(
+                max_position=max_position * (0.65 if crisis else 1.0),
+                max_sector=max_sector * (0.75 if crisis else 1.0),
+                max_turnover=max_turnover, min_cash=max(min_cash, 0.25 if crisis else min_cash),
+                position_caps=position_caps)
+            loop = optimize_with_digital_twin(
+                self.optimizer, self.twin, return_frame, optimizer_method, expected,
+                current_weights or None, sectors, market_caps, view_confidence, constraints,
+                twin_drawdown_probability_limit)
+            portfolio_result = loop.to_dict()
+            # Explicit zero weights make exclusions caused by hard gates visible.
+            for ticker in tickers:
+                portfolio_result["optimization"]["weights"].setdefault(ticker, 0.0)
+
+            if run_strategy_backtest and len(price_frame) >= 320:
+                backtest_constraints = OptimizationConstraints(
+                    max_position=constraints.max_position, max_sector=constraints.max_sector,
+                    max_turnover=max_turnover, min_cash=constraints.min_cash,
+                    position_caps=position_caps)
+
+                def historical_provider(history: pd.DataFrame,
+                                        previous: Dict[str, float]) -> Dict[str, float]:
+                    historical_returns = history.pct_change().dropna().iloc[-504:]
+                    historical_expected = {t: _clip(float(historical_returns[t].iloc[-63:].mean() * 252),
+                                                     -0.40, 0.80) for t in historical_returns}
+                    try:
+                        result = self.optimizer.optimize(
+                            historical_returns, backtest_method, historical_expected, previous,
+                            sectors, market_caps, {t: 0.55 for t in historical_returns},
+                            backtest_constraints)
+                        return result.weights
+                    except Exception:
+                        cap = min(1 / max(len(history.columns), 1), constraints.max_position)
+                        weights = {t: cap for t in history.columns}
+                        weights["CASH"] = max(0.0, 1 - sum(weights.values()))
+                        return weights
+
+                try:
+                    backtest_result = self.backtester.run(price_frame, historical_provider).to_dict()
+                except Exception as exc:
+                    backtest_result = {"error": str(exc)}
+
+        clean_results = [{k: v for k, v in r.items() if not k.startswith("_")} for r in results]
+        report = {
+            "version": "SmartInvest 5.1 BETA 4", "generated_at": datetime.now(timezone.utc).isoformat(),
+            "model_validation_is_separate_from_strategy_backtest": True,
+            "tickers": clean_results, "portfolio_optimization": portfolio_result,
+            "strategy_backtest": backtest_result,
+            "model_governance": self.governance.dashboard_rows(tickers),
+            "disclaimer": "Research software; not financial advice. Past OOS results do not guarantee future performance."}
+        self.print_summary(report)
+        if output_json:
+            Path(output_json).write_text(json.dumps(report, indent=2, default=_jsonable), encoding="utf-8")
+            log(f"JSON report written to {output_json}")
+        return report
+
+    @staticmethod
+    def print_summary(report: Dict[str, Any]) -> None:
+        print("\n" + "=" * 88)
+        print("SMARTINVEST 5.1 BETA 4 — GOVERNED ENSEMBLE & PORTFOLIO ENGINE".center(88))
+        print("=" * 88)
+        for result in report["tickers"]:
+            ticker = result["ticker"]
+            if "memo" not in result:
+                print(f"{ticker:<10} NO RECOMMENDATION — {result.get('gate_reasons') or result.get('error')}")
+                continue
+            memo, pred = result["memo"], result["prediction"]
+            scores = memo["scores"]
+            print(f"{ticker:<10} {scores['decision']:<21} Conviction {pred['conviction_score']:>5.1f} | "
+                  f"Alpha {scores['alpha_score']:+6.1f} Risk {scores['risk_score']:5.1f} "
+                  f"Macro {scores['macro_score']:+6.1f} Fundamental {scores['fundamental_score']:5.1f} "
+                  f"Event {scores['event_risk']:5.1f}")
+            weights = ", ".join(f"{k}={v:.1%}" for k, v in result["ensemble_weights"].items())
+            print(f"           Ensemble: {weights}")
+            for reason in result["gates"]["reasons"]:
+                print(f"           GATE: {reason}")
+        portfolio = report.get("portfolio_optimization")
+        if portfolio:
+            opt, twin = portfolio["optimization"], portfolio["digital_twin"]
+            print("-" * 88)
+            print(f"Portfolio ({opt['method']}): " + ", ".join(
+                f"{k} {v:.1%}" for k, v in opt["weights"].items()))
+            print(f"Digital Twin P(DD>10%) {twin['probability_drawdown_over_10pct']:.1f}% | "
+                  f"VaR95 {twin['var_95_pct']:.2f}% | CVaR95 {twin['cvar_95_pct']:.2f}%")
+            for adjustment in portfolio["adjustments"]:
+                print(f"           {adjustment}")
+        backtest = report.get("strategy_backtest")
+        if backtest and "error" not in backtest:
+            print(f"Strategy backtest: CAGR {backtest['annual_return_pct']:+.2f}% | "
+                  f"Sortino {backtest['sortino']:.2f} | Max DD {backtest['max_drawdown_pct']:.2f}% | "
+                  f"Costs {backtest['total_cost_pct']:.2f}% | Stops {backtest['stop_loss_count']}")
+        print("=" * 88)
+
+
+def run_smartinvest_beta4(tickers: Sequence[str], weights: Optional[Sequence[float]] = None,
+                          optimizer_method: str = "black_litterman",
+                          use_llm: bool = False,
+                          output_json: Optional[str] = "smartinvest_beta4_report.json",
+                          run_strategy_backtest: bool = True,
+                          **kwargs: Any) -> Dict[str, Any]:
+    """Recommended Colab/Jupyter entry point.
+
+    API keys should be set through Colab Secrets/environment variables. PPO is
+    available via optimizer_method="ppo" but is deliberately not the default.
+    """
+    current = None
+    if weights is not None:
+        if len(weights) != len(tickers):
+            raise ValueError("weights must match tickers")
+        current = {str(t).upper(): float(w) for t, w in zip(tickers, weights)}
+        current["CASH"] = max(0.0, 1 - sum(current.values()))
+    system = SmartInvest51Beta4(use_llm=use_llm)
+    return system.run(tickers, current_weights=current, optimizer_method=optimizer_method,
+                      output_json=output_json, run_strategy_backtest=run_strategy_backtest,
+                      **kwargs)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="SmartInvest 5.1 BETA 4")
+    parser.add_argument("--tickers", nargs="+", required=True)
+    parser.add_argument("--weights", nargs="+", type=float)
+    parser.add_argument("--optimizer", default="black_litterman",
+                        choices=("risk_parity", "max_sortino", "black_litterman", "ppo"))
+    parser.add_argument("--output-json", default="smartinvest_beta4_report.json")
+    parser.add_argument("--use-llm", action="store_true")
+    parser.add_argument("--no-backtest", action="store_true")
+    args = parser.parse_args()
+    run_smartinvest_beta4(args.tickers, args.weights, args.optimizer, args.use_llm,
+                          args.output_json, not args.no_backtest)
+
+
+
+
+# =============================================================================
+# SMARTINVEST 5.1 STABLE — PRODUCTION HARDENING LAYER
+# =============================================================================
+# This layer intentionally extends BETA 4 instead of replacing its architecture.
+# Existing raw-data -> model -> governance -> optimizer -> Digital Twin ->
+# backtest separation is preserved.
+
+import hashlib
+import importlib.metadata
+import random
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
+from statistics import NormalDist
+
+APP_VERSION = "SmartInvest 5.1 Stable"
+SCHEMA_VERSION = "5.1.0"
+DEFAULT_RANDOM_SEED = 42
+random.seed(DEFAULT_RANDOM_SEED)
+np.random.seed(DEFAULT_RANDOM_SEED)
+
+
+class ErrorCode(str, Enum):
+    OK = "OK"
+    CONFIG_INVALID = "CONFIG_INVALID"
+    INPUT_INVALID = "INPUT_INVALID"
+    DATA_UNAVAILABLE = "DATA_UNAVAILABLE"
+    DATA_STALE = "DATA_STALE"
+    DATA_INTEGRITY_FAILED = "DATA_INTEGRITY_FAILED"
+    API_TIMEOUT = "API_TIMEOUT"
+    API_RATE_LIMITED = "API_RATE_LIMITED"
+    API_FAILED = "API_FAILED"
+    VALIDATION_INSUFFICIENT = "VALIDATION_INSUFFICIENT"
+    LEAKAGE_GUARD_FAILED = "LEAKAGE_GUARD_FAILED"
+    MODEL_QUARANTINED = "MODEL_QUARANTINED"
+    OPTIMIZER_INFEASIBLE = "OPTIMIZER_INFEASIBLE"
+    OPTIMIZER_FAILED = "OPTIMIZER_FAILED"
+    CONSTRAINT_AUDIT_FAILED = "CONSTRAINT_AUDIT_FAILED"
+    BACKTEST_FAILED = "BACKTEST_FAILED"
+    REPORT_WRITE_FAILED = "REPORT_WRITE_FAILED"
+    INTERNAL_ERROR = "INTERNAL_ERROR"
+
+
+class AnalysisMode(str, Enum):
+    FAST = "fast"
+    STANDARD = "standard"
+    DEEP = "deep"
+
+
+class SmartInvestStableError(RuntimeError):
+    def __init__(self, code: ErrorCode, message: str, *, cause: Optional[BaseException] = None):
+        super().__init__(message)
+        self.code = code
+        self.cause = cause
+
+
+@dataclass(frozen=True)
+class TimeoutPolicy:
+    connect_seconds: float = 5.0
+    read_seconds: float = 20.0
+    total_seconds: float = 30.0
+    attempts: int = 3
+    backoff_base_seconds: float = 0.6
+    backoff_cap_seconds: float = 6.0
+
+    def validate(self) -> "TimeoutPolicy":
+        values = (self.connect_seconds, self.read_seconds, self.total_seconds,
+                  self.backoff_base_seconds, self.backoff_cap_seconds)
+        if any((not np.isfinite(v) or v <= 0) for v in values):
+            raise SmartInvestStableError(ErrorCode.CONFIG_INVALID, "Timeout values must be finite and > 0.")
+        if not (1 <= self.attempts <= 8):
+            raise SmartInvestStableError(ErrorCode.CONFIG_INVALID, "Retry attempts must be in [1, 8].")
+        return self
+
+
+@dataclass(frozen=True)
+class StableRuntimeConfig:
+    mode: AnalysisMode = AnalysisMode.STANDARD
+    random_seed: int = DEFAULT_RANDOM_SEED
+    min_walk_forward_folds: int = 3
+    purge_periods: int = 5
+    embargo_periods: int = 2
+    min_model_evidence_folds: int = 3
+    governance_smoothing: float = 0.35
+    governance_max_weight_change: float = 0.12
+    quarantine_hit_rate: float = 0.42
+    recovery_hit_rate: float = 0.52
+    recovery_runs: int = 2
+    max_parallel_tickers: int = 4
+    timeout: TimeoutPolicy = field(default_factory=TimeoutPolicy)
+
+    def validate(self) -> "StableRuntimeConfig":
+        if not isinstance(self.mode, AnalysisMode):
+            raise SmartInvestStableError(ErrorCode.CONFIG_INVALID, "Invalid analysis mode.")
+        if not (0 <= self.random_seed <= 2**32 - 1):
+            raise SmartInvestStableError(ErrorCode.CONFIG_INVALID, "random_seed out of range.")
+        if self.min_walk_forward_folds < 2:
+            raise SmartInvestStableError(ErrorCode.CONFIG_INVALID, "At least two walk-forward folds required.")
+        if self.purge_periods < 0 or self.embargo_periods < 0:
+            raise SmartInvestStableError(ErrorCode.CONFIG_INVALID, "purge/embargo cannot be negative.")
+        if not (0.0 <= self.governance_smoothing <= 1.0):
+            raise SmartInvestStableError(ErrorCode.CONFIG_INVALID, "governance_smoothing must be in [0,1].")
+        if not (0.0 < self.governance_max_weight_change <= 1.0):
+            raise SmartInvestStableError(ErrorCode.CONFIG_INVALID, "governance_max_weight_change must be in (0,1].")
+        if not (0.0 <= self.quarantine_hit_rate < self.recovery_hit_rate <= 1.0):
+            raise SmartInvestStableError(ErrorCode.CONFIG_INVALID, "Invalid governance quarantine/recovery thresholds.")
+        if self.recovery_runs < 1:
+            raise SmartInvestStableError(ErrorCode.CONFIG_INVALID, "recovery_runs must be >=1.")
+        if not (1 <= self.max_parallel_tickers <= 16):
+            raise SmartInvestStableError(ErrorCode.CONFIG_INVALID, "max_parallel_tickers must be in [1,16].")
+        self.timeout.validate()
+        return self
+
+    @classmethod
+    def from_env(cls, mode: str = "standard") -> "StableRuntimeConfig":
+        try:
+            return cls(
+                mode=AnalysisMode(mode.lower()),
+                random_seed=int(os.getenv("SMARTINVEST_SEED", str(DEFAULT_RANDOM_SEED))),
+                min_walk_forward_folds=int(os.getenv("SMARTINVEST_MIN_WF_FOLDS", "3")),
+                purge_periods=int(os.getenv("SMARTINVEST_PURGE_PERIODS", "5")),
+                embargo_periods=int(os.getenv("SMARTINVEST_EMBARGO_PERIODS", "2")),
+                min_model_evidence_folds=int(os.getenv("SMARTINVEST_MIN_MODEL_EVIDENCE", "3")),
+                governance_smoothing=float(os.getenv("SMARTINVEST_GOV_SMOOTHING", "0.35")),
+                governance_max_weight_change=float(os.getenv("SMARTINVEST_GOV_MAX_DELTA", "0.12")),
+                quarantine_hit_rate=float(os.getenv("SMARTINVEST_GOV_QUARANTINE_HIT", "0.42")),
+                recovery_hit_rate=float(os.getenv("SMARTINVEST_GOV_RECOVERY_HIT", "0.52")),
+                recovery_runs=int(os.getenv("SMARTINVEST_GOV_RECOVERY_RUNS", "2")),
+                max_parallel_tickers=int(os.getenv("SMARTINVEST_MAX_WORKERS", "4")),
+                timeout=TimeoutPolicy(
+                    connect_seconds=float(os.getenv("SMARTINVEST_CONNECT_TIMEOUT", "5")),
+                    read_seconds=float(os.getenv("SMARTINVEST_READ_TIMEOUT", "20")),
+                    total_seconds=float(os.getenv("SMARTINVEST_TOTAL_TIMEOUT", "30")),
+                    attempts=int(os.getenv("SMARTINVEST_API_ATTEMPTS", "3")),
+                    backoff_base_seconds=float(os.getenv("SMARTINVEST_BACKOFF_BASE", "0.6")),
+                    backoff_cap_seconds=float(os.getenv("SMARTINVEST_BACKOFF_CAP", "6")),
+                ),
+            ).validate()
+        except (ValueError, TypeError) as exc:
+            raise SmartInvestStableError(ErrorCode.CONFIG_INVALID, f"Invalid environment configuration: {exc}") from exc
+
+
+def _validate_ticker(ticker: str) -> str:
+    if not isinstance(ticker, str):
+        raise SmartInvestStableError(ErrorCode.INPUT_INVALID, "Ticker must be a string.")
+    value = ticker.strip().upper()
+    if not value or len(value) > 24:
+        raise SmartInvestStableError(ErrorCode.INPUT_INVALID, f"Invalid ticker {ticker!r}.")
+    allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-^=")
+    if any(ch not in allowed for ch in value):
+        raise SmartInvestStableError(ErrorCode.INPUT_INVALID, f"Ticker contains unsupported characters: {ticker!r}.")
+    return value
+
+
+def _validate_probability(value: float, name: str) -> float:
+    out = float(value)
+    if not np.isfinite(out) or not 0.0 <= out <= 1.0:
+        raise SmartInvestStableError(ErrorCode.INPUT_INVALID, f"{name} must be in [0,1].")
+    return out
+
+
+def _validate_fraction(value: float, name: str, *, upper: float = 1.0) -> float:
+    out = float(value)
+    if not np.isfinite(out) or not 0.0 <= out <= upper:
+        raise SmartInvestStableError(ErrorCode.INPUT_INVALID, f"{name} must be in [0,{upper}].")
+    return out
+
+
+def _atomic_write_text(path: str | Path, content: str) -> None:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_suffix(target.suffix + f".{os.getpid()}.tmp")
+    tmp.write_text(content, encoding="utf-8")
+    os.replace(tmp, target)
+
+
+@contextmanager
+def sqlite_transaction(db_path: str):
+    conn = sqlite3.connect(db_path, timeout=15.0)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=FULL")
+        conn.execute("PRAGMA busy_timeout=15000")
+        conn.execute("BEGIN IMMEDIATE")
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def retry_call(fn: Callable[[], Any], *, policy: TimeoutPolicy,
+               retry_on: Tuple[type, ...] = (TimeoutError, ConnectionError, OSError)) -> Any:
+    last: Optional[BaseException] = None
+    started = time.monotonic()
+    for attempt in range(policy.attempts):
+        try:
+            return fn()
+        except retry_on as exc:
+            last = exc
+        except Exception as exc:
+            # requests exceptions are optional at import time
+            if requests is not None and isinstance(
+                exc, (requests.Timeout, requests.ConnectionError)
+            ):
+                last = exc
+            else:
+                raise
+        elapsed = time.monotonic() - started
+        if elapsed >= policy.total_seconds:
+            break
+        delay = min(policy.backoff_cap_seconds,
+                    policy.backoff_base_seconds * (2 ** attempt))
+        delay *= 0.9 + 0.2 * random.Random(DEFAULT_RANDOM_SEED + attempt).random()
+        time.sleep(min(delay, max(0.0, policy.total_seconds - elapsed)))
+    raise SmartInvestStableError(
+        ErrorCode.API_TIMEOUT if last and "timeout" in type(last).__name__.lower() else ErrorCode.API_FAILED,
+        f"External API failed after {policy.attempts} attempt(s): {last}",
+        cause=last,
+    )
+
+
+# ---------- Data integrity / persistence hardening ----------------------------
+
+_BaseDataIntegrityEngine = DataIntegrityEngine
+
+
+class DataIntegrityEngine(_BaseDataIntegrityEngine):
+    def __init__(self, db_path: str = SecureConfig.CACHE_DB,
+                 runtime: Optional[StableRuntimeConfig] = None):
+        self.runtime = (runtime or StableRuntimeConfig.from_env()).validate()
+        super().__init__(db_path)
+        with sqlite_transaction(self.db_path) as conn:
+            conn.execute("""CREATE TABLE IF NOT EXISTS api_status_v51 (
+                source TEXT PRIMARY KEY, last_status TEXT, last_error TEXT,
+                updated_at TEXT NOT NULL)""")
+
+    def _write_cache(self, ticker: str, df: pd.DataFrame) -> None:
+        ticker = _validate_ticker(ticker)
+        clean = self._normalize(df)
+        if clean.empty:
+            return
+        rows = []
+        for dt, row in clean.iterrows():
+            values = [_safe_float(row.get(k)) for k in ("Open", "High", "Low", "Close", "Volume")]
+            if values[3] is None or values[3] <= 0:
+                continue
+            rows.append((ticker, str(pd.Timestamp(dt).date()), *values))
+        if not rows:
+            return
+        with sqlite_transaction(self.db_path) as conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO price_cache_v4 VALUES (?,?,?,?,?,?,?)", rows
+            )
+
+    @staticmethod
+    def _strict_frame_checks(df: pd.DataFrame) -> List[str]:
+        warnings_out: List[str] = []
+        if df.empty:
+            return ["No rows."]
+        close = pd.to_numeric(df["Close"], errors="coerce") if "Close" in df else pd.Series(dtype=float)
+        if close.empty or close.isna().all():
+            warnings_out.append("Close series unavailable.")
+        elif (close <= 0).any():
+            warnings_out.append("Non-positive close detected.")
+        if not df.index.is_monotonic_increasing:
+            warnings_out.append("Index is not monotonic.")
+        if df.index.duplicated().any():
+            warnings_out.append("Duplicate timestamps detected.")
+        if {"Low", "High"}.issubset(df.columns):
+            bad = (pd.to_numeric(df["Low"], errors="coerce") >
+                   pd.to_numeric(df["High"], errors="coerce")).fillna(False)
+            if bad.any():
+                warnings_out.append("OHLC invariant Low <= High violated.")
+        return warnings_out
+
+    def fetch(self, ticker: str, period: str = "5y"):
+        ticker = _validate_ticker(ticker)
+        if period not in {"6mo", "1y", "2y", "3y", "5y", "10y", "max"}:
+            raise SmartInvestStableError(ErrorCode.INPUT_INVALID, f"Unsupported period: {period}")
+        # Keep the BETA 4 live-first/cached fallback semantics. Failures are
+        # explicit; there is still no synthetic market-data fallback.
+        df, report = super().fetch(ticker, period)
+        if df is not None:
+            integrity_warnings = self._strict_frame_checks(df)
+            if integrity_warnings:
+                report.warnings.extend(integrity_warnings)
+                if any("Non-positive" in w or "Close series" in w or "OHLC invariant" in w
+                       for w in integrity_warnings):
+                    report.status = DataStatus.INVALID
+                    report.confidence_score = min(report.confidence_score, 20.0)
+                    return None, report
+        return df, report
+
+
+# ---------- Walk-forward validation 2.0 ---------------------------------------
+
+_BaseValidationReport = ValidationReport
+
+
+@dataclass
+class ValidationReport:
+    ticker: str
+    folds: List[FoldResult]
+    per_model: Dict[str, ModelValidationMetric]
+    overall_directional_accuracy: float
+    overall_mae: float
+    regime_accuracy: Dict[str, float]
+    degrading: bool
+    degradation_note: str
+    hit_rate_ci_95: Tuple[Optional[float], Optional[float]] = (None, None)
+    baselines: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    leakage_audit: Dict[str, Any] = field(default_factory=dict)
+    minimum_folds_met: bool = False
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+def _wilson_interval(successes: int, total: int, confidence: float = 0.95) -> Tuple[Optional[float], Optional[float]]:
+    if total <= 0:
+        return (None, None)
+    z = NormalDist().inv_cdf(0.5 + confidence / 2)
+    phat = successes / total
+    denom = 1 + z * z / total
+    centre = (phat + z * z / (2 * total)) / denom
+    radius = z * math.sqrt((phat * (1 - phat) / total) + z * z / (4 * total * total)) / denom
+    return (round(max(0.0, centre - radius), 4), round(min(1.0, centre + radius), 4))
+
+
+def _wf_split_indices(n: int, n_splits: int, test_size: int, min_train: int,
+                      purge: int, embargo: int) -> List[Tuple[np.ndarray, np.ndarray]]:
+    if min(purge, embargo) < 0:
+        raise SmartInvestStableError(ErrorCode.INPUT_INVALID, "purge/embargo cannot be negative.")
+    start_test = n - n_splits * test_size
+    if start_test <= 0:
+        return []
+    out = []
+    prior_test_end = -1
+    for fold in range(n_splits):
+        test_start = start_test + fold * test_size
+        test_end = min(n, test_start + test_size)
+        train_end = test_start - purge
+        # Embargo protects against observations immediately following the prior
+        # test interval becoming training data in a later expanding fold.
+        train_idx = np.arange(0, max(0, train_end), dtype=int)
+        if prior_test_end >= 0 and embargo > 0:
+            forbidden_start = prior_test_end
+            forbidden_end = min(n, prior_test_end + embargo)
+            train_idx = train_idx[(train_idx < forbidden_start) | (train_idx >= forbidden_end)]
+        test_idx = np.arange(test_start, test_end, dtype=int)
+        if len(train_idx) >= min_train and len(test_idx):
+            out.append((train_idx, test_idx))
+        prior_test_end = test_end
+    return out
+
+
+def walk_forward_validate(features: pd.DataFrame, regimes: pd.Series, ticker: str,
+                          n_splits: int = 5, min_train: int = 180,
+                          horizon: int = 5, purge_periods: Optional[int] = None,
+                          embargo_periods: int = 2, min_folds: int = 3) -> ValidationReport:
+    ticker = _validate_ticker(ticker)
+    if horizon < 1 or horizon > 63:
+        raise SmartInvestStableError(ErrorCode.INPUT_INVALID, "horizon must be in [1,63].")
+    data = features.replace([np.inf, -np.inf], np.nan).dropna().copy()
+    empty = ValidationReport(
+        ticker, [], {}, float("nan"), float("nan"), {}, False,
+        "Insufficient history for purged walk-forward validation.",
+        leakage_audit={"passed": False, "reason": "insufficient_history"},
+        minimum_folds_met=False,
+    )
+    if len(data) < min_train + 40:
+        return empty
+    feature_cols = [c for c in data if c != "target_fwd_ret"]
+    if "target_fwd_ret" not in data or not feature_cols:
+        raise SmartInvestStableError(ErrorCode.INPUT_INVALID, "Features require predictors and target_fwd_ret.")
+    X, y = data[feature_cols], data["target_fwd_ret"]
+    aligned_regimes = regimes.reindex(data.index).fillna("sideways")
+    purge = max(horizon, purge_periods if purge_periods is not None else horizon)
+    test_size = max(20, min(63, len(data) // (n_splits + 3)))
+    splits = _wf_split_indices(len(data), n_splits, test_size, min_train, purge, embargo_periods)
+
+    folds: List[FoldResult] = []
+    pooled_hits: Dict[str, Dict[str, List[int]]] = {}
+    all_ensemble_hits: List[int] = []
+    baseline_hits: Dict[str, List[int]] = {"zero_return": [], "momentum": []}
+    leakage_rows: List[Dict[str, Any]] = []
+
+    for fold_id, (train_idx, test_idx) in enumerate(splits, 1):
+        if train_idx[-1] + purge >= test_idx[0]:
+            raise SmartInvestStableError(ErrorCode.LEAKAGE_GUARD_FAILED, "Purged split invariant violated.")
+        leakage_rows.append({
+            "fold": fold_id,
+            "train_last_pos": int(train_idx[-1]),
+            "test_first_pos": int(test_idx[0]),
+            "purge": int(purge),
+            "embargo": int(embargo_periods),
+            "passed": True,
+        })
+        X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+        reg_test = aligned_regimes.iloc[test_idx]
+        try:
+            ensemble = ModelEnsemble().fit(X_train, y_train)
+            predictions = ensemble.predict_all(X_test)
+        except Exception as exc:
+            log(f"{ticker} fold {fold_id} skipped: {type(exc).__name__}: {exc}", "WARN")
+            continue
+
+        metrics: Dict[str, FoldModelMetric] = {}
+        for name, pred in predictions.items():
+            metrics[name] = _model_metric(pred, y_test.values, reg_test, y_train.values)
+            hits = np.sign(pred) == np.sign(y_test.values)
+            pooled_hits.setdefault(name, {})
+            for regime in pd.unique(reg_test):
+                mask = np.asarray(reg_test == regime)
+                pooled_hits[name].setdefault(str(regime), []).extend(hits[mask].astype(int).tolist())
+
+        blended = np.mean(np.vstack(list(predictions.values())), axis=0)
+        ensemble_hits = (np.sign(blended) == np.sign(y_test.values)).astype(int)
+        all_ensemble_hits.extend(ensemble_hits.tolist())
+
+        # Trivial baselines use only information available at each forecast origin.
+        zero_pred = np.zeros(len(test_idx), dtype=float)
+        momentum_col = "ret_20" if "ret_20" in X_test else ("ret_5" if "ret_5" in X_test else None)
+        momentum_pred = X_test[momentum_col].to_numpy(dtype=float) if momentum_col else zero_pred.copy()
+        baseline_hits["zero_return"].extend((np.sign(zero_pred) == np.sign(y_test.values)).astype(int).tolist())
+        baseline_hits["momentum"].extend((np.sign(momentum_pred) == np.sign(y_test.values)).astype(int).tolist())
+
+        strategy_returns = np.where(blended > 0, y_test.values, 0.0)
+        mean_ret, std_ret = float(np.mean(strategy_returns)), float(np.std(strategy_returns))
+        downside = strategy_returns[strategy_returns < 0]
+        downside_std = float(np.std(downside)) if len(downside) else 0.0
+        ann = math.sqrt(252 / max(horizon, 1))
+        folds.append(FoldResult(
+            fold_id, str(X_test.index.min().date()), str(X_test.index.max().date()), len(test_idx),
+            {str(k): round(float(v), 4) for k, v in reg_test.value_counts(normalize=True).items()},
+            metrics, round(float(np.mean(np.abs(blended - y_test.values))), 6),
+            round(float(np.mean(ensemble_hits)), 4),
+            round(mean_ret / std_ret * ann, 3) if std_ret > 1e-9 else 0.0,
+            round(mean_ret / downside_std * ann, 3) if downside_std > 1e-9 else 0.0,
+        ))
+
+    if not folds:
+        return empty
+
+    names = sorted({name for fold in folds for name in fold.per_model})
+    aggregated: Dict[str, ModelValidationMetric] = {}
+    for name in names:
+        values = [fold.per_model[name] for fold in folds if name in fold.per_model]
+        regime_acc = {regime: round(float(np.mean(hits)), 4)
+                      for regime, hits in pooled_hits.get(name, {}).items() if hits}
+        last_hit = values[-1].recent_hit_rate
+        slope = (float(np.polyfit(np.arange(len(values)), [v.hit_rate for v in values], 1)[0])
+                 if len(values) >= 3 else 0.0)
+        severe = bool(last_hit < 0.40 or slope < -0.05 or values[-1].prediction_drift > 2.5)
+        aggregated[name] = ModelValidationMetric(
+            round(float(np.mean([v.mae for v in values])), 6),
+            round(float(np.mean([v.hit_rate for v in values])), 4), last_hit,
+            round(float(np.mean([v.calibration_error for v in values])), 5),
+            round(float(np.mean([v.prediction_drift for v in values])), 4),
+            round(float(np.mean([v.residual_std for v in values])), 6),
+            regime_acc, severe,
+        )
+
+    fold_acc = np.asarray([f.ensemble_hit_rate for f in folds], dtype=float)
+    slope = float(np.polyfit(np.arange(len(fold_acc)), fold_acc, 1)[0]) if len(fold_acc) >= 3 else 0.0
+    degrading = bool(slope < -0.03 or fold_acc[-1] < 0.45)
+    note = (f"Ensemble OOS hit-rate slope {slope:+.3f}/fold; latest {fold_acc[-1]:.1%}."
+            if degrading else "No severe ensemble degradation detected.")
+    ensemble_regime: Dict[str, List[float]] = {}
+    for fold in folds:
+        for regime in fold.regime_mix:
+            available = [m.regime_accuracy[regime] for m in fold.per_model.values()
+                         if regime in m.regime_accuracy]
+            if available:
+                ensemble_regime.setdefault(regime, []).append(float(np.mean(available)))
+
+    baseline_summary = {}
+    for name, hits in baseline_hits.items():
+        baseline_summary[name] = {
+            "hit_rate": round(float(np.mean(hits)), 4) if hits else float("nan"),
+            "observations": len(hits),
+        }
+    ci = _wilson_interval(sum(all_ensemble_hits), len(all_ensemble_hits))
+    min_ok = len(folds) >= min_folds
+    if not min_ok:
+        degrading = True
+        note += f" Minimum evidence not met: {len(folds)}/{min_folds} folds."
+    return ValidationReport(
+        ticker, folds, aggregated, round(float(np.mean(fold_acc)), 4),
+        round(float(np.mean([f.ensemble_mae for f in folds])), 6),
+        {k: round(float(np.mean(v)), 4) for k, v in ensemble_regime.items()},
+        degrading, note, ci, baseline_summary,
+        {"passed": True, "purge_periods": purge, "embargo_periods": embargo_periods,
+         "folds": leakage_rows}, min_ok,
+    )
+
+
+# ---------- Model governance stable -------------------------------------------
+
+_BaseModelGovernance = ModelGovernance
+
+
+class ModelGovernance(_BaseModelGovernance):
+    def __init__(self, db_path: str = SecureConfig.CACHE_DB,
+                 runtime: Optional[StableRuntimeConfig] = None):
+        self.runtime = (runtime or StableRuntimeConfig.from_env()).validate()
+        super().__init__(db_path)
+        with sqlite_transaction(self.db_path) as conn:
+            conn.execute("""CREATE TABLE IF NOT EXISTS governance_state_v51 (
+                ticker TEXT, model_name TEXT, weight REAL NOT NULL,
+                quarantined INTEGER NOT NULL DEFAULT 0,
+                recovery_streak INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (ticker, model_name))""")
+
+    def log_fold_results(self, ticker: str, validation: ValidationReport) -> None:
+        rows = []
+        for fold in validation.folds:
+            for model_name, metric in fold.per_model.items():
+                severe = int(validation.per_model.get(
+                    model_name, ModelValidationMetric(0, 0, 0, 1, 99, 0, {}, True)
+                ).severe_degradation)
+                rows.append((ticker, model_name, fold.test_end, fold.fold, "__overall__",
+                             metric.mae, metric.hit_rate, metric.recent_hit_rate,
+                             metric.calibration_error, metric.prediction_drift,
+                             metric.residual_std, severe))
+                for regime, regime_hit in metric.regime_accuracy.items():
+                    rows.append((ticker, model_name, fold.test_end, fold.fold, regime,
+                                 metric.mae, regime_hit, metric.recent_hit_rate,
+                                 metric.calibration_error, metric.prediction_drift,
+                                 metric.residual_std, severe))
+        if rows:
+            with sqlite_transaction(self.db_path) as conn:
+                conn.executemany(
+                    "INSERT OR REPLACE INTO model_performance_v4 VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", rows
+                )
+
+    def _state(self, ticker: str, model_name: str) -> Optional[Tuple[float, bool, int]]:
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT weight,quarantined,recovery_streak FROM governance_state_v51 "
+                "WHERE ticker=? AND model_name=?", (ticker, model_name)
+            ).fetchone()
+        return (float(row[0]), bool(row[1]), int(row[2])) if row else None
+
+    def dynamic_weights(self, ticker: str, validation: ValidationReport,
+                        current_regime: str):
+        proposed, components = super().dynamic_weights(ticker, validation, current_regime)
+        names = sorted(proposed)
+        if not names:
+            return proposed, components
+
+        evidence = len(validation.folds)
+        now = datetime.now(timezone.utc).isoformat()
+        adjusted: Dict[str, float] = {}
+        state_rows = []
+
+        for name in names:
+            metric = validation.per_model[name]
+            prior = self._state(ticker, name)
+            prior_weight = prior[0] if prior else 1.0 / len(names)
+            quarantined = prior[1] if prior else False
+            recovery_streak = prior[2] if prior else 0
+
+            if metric.severe_degradation or metric.recent_hit_rate < self.runtime.quarantine_hit_rate:
+                quarantined = True
+                recovery_streak = 0
+            elif quarantined:
+                if (metric.recent_hit_rate >= self.runtime.recovery_hit_rate
+                        and not metric.severe_degradation):
+                    recovery_streak += 1
+                    if recovery_streak >= self.runtime.recovery_runs:
+                        quarantined = False
+                        recovery_streak = 0
+                else:
+                    recovery_streak = 0
+
+            target = proposed[name]
+            if evidence < self.runtime.min_model_evidence_folds:
+                # Minimum evidence threshold: remain close to prior/equal weight.
+                target = 0.25 * target + 0.75 * prior_weight
+                components[name]["evidence_limited"] = True
+            else:
+                components[name]["evidence_limited"] = False
+
+            if quarantined:
+                target = min(target, 0.01)
+
+            smooth = self.runtime.governance_smoothing
+            target = prior_weight * (1.0 - smooth) + target * smooth
+            delta = _clip(target - prior_weight,
+                          -self.runtime.governance_max_weight_change,
+                          self.runtime.governance_max_weight_change)
+            new_weight = max(0.0, prior_weight + delta)
+            adjusted[name] = new_weight
+            components[name].update({
+                "prior_weight": round(prior_weight, 6),
+                "quarantined": quarantined,
+                "recovery_streak": recovery_streak,
+                "evidence_folds": evidence,
+            })
+            state_rows.append([ticker, name, new_weight, int(quarantined),
+                               recovery_streak, now])
+
+        total = sum(adjusted.values())
+        if total <= 1e-12:
+            adjusted = {name: 1.0 / len(names) for name in names}
+        else:
+            adjusted = {name: value / total for name, value in adjusted.items()}
+
+        with sqlite_transaction(self.db_path) as conn:
+            for row in state_rows:
+                row[2] = adjusted[row[1]]
+            conn.executemany(
+                "INSERT OR REPLACE INTO governance_state_v51 VALUES (?,?,?,?,?,?)", state_rows
+            )
+        return {k: round(v, 6) for k, v in adjusted.items()}, components
+
+    def dashboard_rows(self, tickers: Sequence[str]) -> List[Dict[str, Any]]:
+        rows = super().dashboard_rows(tickers)
+        state_map = {}
+        with sqlite3.connect(self.db_path) as conn:
+            for ticker, model, weight, quarantined, recovery, updated in conn.execute(
+                "SELECT ticker,model_name,weight,quarantined,recovery_streak,updated_at "
+                "FROM governance_state_v51"
+            ):
+                state_map[(ticker, model)] = (weight, bool(quarantined), recovery, updated)
+        for row in rows:
+            state = state_map.get((row["ticker"], row["model"]))
+            row.update({
+                "live_weight": state[0] if state else None,
+                "quarantined": state[1] if state else False,
+                "recovery_streak": state[2] if state else 0,
+                "governance_updated_at": state[3] if state else None,
+            })
+        return rows
+
+
+# ---------- Fundamentals / event reliability ---------------------------------
+
+_BaseFundamentalReport = FundamentalReport
+
+
+@dataclass
+class FundamentalReport:
+    ticker: str
+    available: bool
+    sector: str
+    fundamental_score: float
+    valuation_flag: str
+    trailing_pe: Optional[float]
+    sector_median_pe: Optional[float]
+    sector_relative_pe: Optional[float]
+    historical_pe_percentile: Optional[float]
+    fcf_yield_pct: Optional[float]
+    roic_pct: Optional[float]
+    wacc_pct: Optional[float]
+    roic_minus_wacc_pct: Optional[float]
+    net_debt_to_ebitda: Optional[float]
+    earnings_quality: Optional[float]
+    margin_trend_pct_points: Optional[float]
+    revenue_growth_pct: Optional[float]
+    earnings_growth_pct: Optional[float]
+    revenue_revision_pct: Optional[float]
+    earnings_revision_pct: Optional[float]
+    notes: List[str] = field(default_factory=list)
+    confidence_score: float = 0.0
+    field_availability: Dict[str, bool] = field(default_factory=dict)
+
+    def to_dict(self):
+        return asdict(self)
+
+
+_BaseFundamentalEngine = FundamentalEngine
+
+
+class FundamentalEngine(_BaseFundamentalEngine):
+    def __init__(self, db_path: str = SecureConfig.CACHE_DB):
+        super().__init__(db_path)
+        self._cache_lock = threading.RLock()
+        with sqlite_transaction(self.db_path) as conn:
+            conn.execute("""CREATE TABLE IF NOT EXISTS sector_cache_v51 (
+                ticker TEXT PRIMARY KEY, sector TEXT NOT NULL, updated_at TEXT NOT NULL)""")
+
+    def _info(self, ticker: str) -> Dict[str, Any]:
+        ticker = _validate_ticker(ticker)
+        with self._cache_lock:
+            if ticker in self._info_cache:
+                return self._info_cache[ticker]
+        info: Dict[str, Any] = {}
+        if YFINANCE_OK:
+            try:
+                obj = yf.Ticker(ticker)
+                # fast_info is intentionally supplementary; .info remains
+                # optional rather than a single point of failure.
+                try:
+                    fast = dict(obj.fast_info or {})
+                    info.update({k: v for k, v in fast.items() if v is not None})
+                except Exception:
+                    pass
+                try:
+                    slow = obj.info or {}
+                    info.update({k: v for k, v in slow.items() if v is not None})
+                except Exception:
+                    pass
+            except Exception:
+                info = {}
+        with self._cache_lock:
+            self._info_cache[ticker] = info
+        sector = str(info.get("sector") or "Unknown")
+        if sector != "Unknown":
+            with sqlite_transaction(self.db_path) as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO sector_cache_v51 VALUES (?,?,?)",
+                    (ticker, sector, datetime.now(timezone.utc).isoformat()),
+                )
+        return info
+
+    def analyze(self, ticker: str, peer_universe: Optional[Sequence[str]] = None):
+        report = super().analyze(_validate_ticker(ticker), peer_universe)
+        values = {
+            "trailing_pe": report.trailing_pe,
+            "fcf_yield_pct": report.fcf_yield_pct,
+            "roic_pct": report.roic_pct,
+            "net_debt_to_ebitda": report.net_debt_to_ebitda,
+            "earnings_quality": report.earnings_quality,
+            "margin_trend_pct_points": report.margin_trend_pct_points,
+            "revenue_growth_pct": report.revenue_growth_pct,
+            "earnings_growth_pct": report.earnings_growth_pct,
+            "revenue_revision_pct": report.revenue_revision_pct,
+            "earnings_revision_pct": report.earnings_revision_pct,
+        }
+        availability = {k: v is not None for k, v in values.items()}
+        core = ["trailing_pe", "fcf_yield_pct", "roic_pct", "net_debt_to_ebitda",
+                "revenue_growth_pct", "earnings_growth_pct"]
+        confidence = 100.0 * sum(availability[k] for k in core) / len(core)
+        if report.sector == "Unknown":
+            confidence -= 10
+        if not report.available:
+            confidence = 0.0
+        report.confidence_score = round(_clip(confidence, 0, 100), 1)
+        report.field_availability = availability
+        missing = [k for k, ok in availability.items() if not ok]
+        if missing:
+            report.notes.append("Missing fundamental fields: " + ", ".join(missing))
+        return report
+
+
+_BaseEventReport = EventReport
+
+
+@dataclass
+class EventReport:
+    ticker: str
+    event_risk_score: float
+    high_event_risk: bool
+    next_earnings_date: Optional[str]
+    next_dividend_date: Optional[str]
+    split_detected: bool
+    analyst_revision_count_30d: int
+    guidance_or_material_events: List[str]
+    macro_events: List[Dict[str, Any]]
+    position_size_multiplier: float
+    notes: List[str] = field(default_factory=list)
+    availability: Dict[str, str] = field(default_factory=dict)
+
+    def to_dict(self):
+        return asdict(self)
+
+
+_BaseEventEngine = EventEngine
+
+
+class EventEngine(_BaseEventEngine):
+    def analyze(self, ticker: str):
+        report = super().analyze(_validate_ticker(ticker))
+        report.availability = {
+            "earnings": "AVAILABLE" if report.next_earnings_date else "NO_DATA",
+            "dividends": "AVAILABLE" if report.next_dividend_date else "NO_DATA",
+            "splits": "AVAILABLE" if report.split_detected else "NO_RECENT_EVENT_OR_NO_DATA",
+            "analyst_revisions": "AVAILABLE" if report.analyst_revision_count_30d > 0 else "NO_RECENT_EVENT_OR_NO_DATA",
+            "material_news": "AVAILABLE" if report.guidance_or_material_events else "NO_MATCH_OR_NO_DATA",
+            "macro_calendar": "AVAILABLE" if report.macro_events else (
+                "UNAVAILABLE_NO_FRED_KEY" if not SecureConfig.FRED_API_KEY else "NO_RELEVANT_EVENT"
+            ),
+        }
+        return report
+
+
+# ---------- Optimizer robustness / audits ------------------------------------
+
+_BaseOptimizationResult = OptimizationResult
+
+
+@dataclass
+class OptimizationResult:
+    method: str
+    weights: Dict[str, float]
+    expected_return_pct: float
+    volatility_pct: float
+    sortino: float
+    one_way_turnover: float
+    success: bool
+    message: str
+    constraints: Dict[str, Any]
+    diagnostics: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self):
+        return asdict(self)
+
+
+_BasePortfolioOptimizer = PortfolioOptimizer
+
+
+class PortfolioOptimizer(_BasePortfolioOptimizer):
+    @staticmethod
+    def feasible_constraints(tickers: Sequence[str], sectors: Dict[str, str],
+                             constraints: OptimizationConstraints,
+                             previous_weights: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
+        n = len(tickers)
+        if n == 0:
+            return {"feasible": False, "reasons": ["No assets."]}
+        reasons = []
+        for name, value in (
+            ("max_position", constraints.max_position),
+            ("max_sector", constraints.max_sector),
+            ("max_turnover", constraints.max_turnover),
+            ("min_cash", constraints.min_cash),
+        ):
+            if not np.isfinite(value):
+                reasons.append(f"{name} is not finite.")
+        if not (0 < constraints.max_position <= 1):
+            reasons.append("max_position must be in (0,1].")
+        if not (0 < constraints.max_sector <= 1):
+            reasons.append("max_sector must be in (0,1].")
+        if not (0 <= constraints.max_turnover <= 1):
+            reasons.append("max_turnover must be in [0,1].")
+        if not (0 <= constraints.min_cash < 1):
+            reasons.append("min_cash must be in [0,1).")
+        caps = {t: min(constraints.max_position,
+                       constraints.position_caps.get(t, constraints.max_position))
+                for t in tickers}
+        if any(v < 0 for v in caps.values()):
+            reasons.append("Position caps cannot be negative.")
+        risky_capacity = sum(caps.values())
+        sector_capacity = 0.0
+        for sector in set(sectors.get(t, "Unknown") for t in tickers):
+            sector_capacity += min(
+                constraints.max_sector,
+                sum(caps[t] for t in tickers if sectors.get(t, "Unknown") == sector),
+            )
+        requested_risky = 1.0 - constraints.min_cash
+        if min(risky_capacity, sector_capacity) <= 0:
+            reasons.append("No positive risky allocation is feasible.")
+        # A lower risky sum is valid because CASH is explicit, so insufficient
+        # risky capacity is not itself infeasible.
+        return {
+            "feasible": not reasons,
+            "reasons": reasons,
+            "risky_capacity": round(risky_capacity, 6),
+            "sector_capacity": round(sector_capacity, 6),
+            "requested_risky_max": round(requested_risky, 6),
+        }
+
+    @staticmethod
+    def constraint_audit(result: OptimizationResult, tickers: Sequence[str],
+                         sectors: Dict[str, str], constraints: OptimizationConstraints,
+                         previous_weights: Optional[Dict[str, float]]) -> Dict[str, Any]:
+        w = result.weights
+        risky_sum = sum(float(w.get(t, 0.0)) for t in tickers)
+        total = risky_sum + float(w.get("CASH", 0.0))
+        position_violations = {
+            t: float(w.get(t, 0.0))
+            for t in tickers
+            if float(w.get(t, 0.0)) >
+            min(constraints.max_position, constraints.position_caps.get(t, constraints.max_position)) + 1e-6
+        }
+        sector_weights = {
+            s: sum(float(w.get(t, 0.0)) for t in tickers if sectors.get(t, "Unknown") == s)
+            for s in set(sectors.get(t, "Unknown") for t in tickers)
+        }
+        sector_violations = {s: v for s, v in sector_weights.items() if v > constraints.max_sector + 1e-6}
+        cash_ok = float(w.get("CASH", 0.0)) + 1e-6 >= constraints.min_cash
+        turnover_ok = (previous_weights is None or
+                       result.one_way_turnover <= constraints.max_turnover + 1e-5)
+        passed = (abs(total - 1.0) <= 5e-5 and not position_violations and
+                  not sector_violations and cash_ok and turnover_ok)
+        return {
+            "passed": passed,
+            "weight_sum": round(total, 8),
+            "weight_sum_ok": abs(total - 1.0) <= 5e-5,
+            "cash_ok": cash_ok,
+            "turnover": result.one_way_turnover,
+            "turnover_ok": turnover_ok,
+            "sector_weights": {k: round(v, 6) for k, v in sector_weights.items()},
+            "sector_violations": sector_violations,
+            "position_violations": position_violations,
+        }
+
+    def _deterministic_fallback(self, returns: pd.DataFrame, tickers: Sequence[str],
+                                previous_weights: Optional[Dict[str, float]],
+                                sectors: Dict[str, str],
+                                constraints: OptimizationConstraints,
+                                reason: str) -> OptimizationResult:
+        caps = np.asarray([
+            min(constraints.max_position,
+                constraints.position_caps.get(t, constraints.max_position))
+            for t in tickers
+        ], dtype=float)
+        if previous_weights:
+            raw = np.asarray([max(0.0, previous_weights.get(t, 0.0)) for t in tickers])
+        else:
+            raw = np.ones(len(tickers), dtype=float)
+        target = min(1.0 - constraints.min_cash, float(caps.sum()))
+        raw = self._capped_allocation(raw, caps, target)
+        expected = returns.mean().to_numpy(dtype=float) * 252
+        result = self._finalize(
+            "deterministic_fallback", raw, returns, expected, tickers,
+            previous_weights, sectors, constraints, False,
+            f"Fallback used: {reason}",
+        )
+        return result
+
+    def optimize(self, returns: pd.DataFrame, method: str = "risk_parity",
+                 expected_returns: Optional[Dict[str, float]] = None,
+                 previous_weights: Optional[Dict[str, float]] = None,
+                 sectors: Optional[Dict[str, str]] = None,
+                 market_caps: Optional[Dict[str, float]] = None,
+                 view_confidence: Optional[Dict[str, float]] = None,
+                 constraints: Optional[OptimizationConstraints] = None,
+                 ppo_timesteps: int = 10_000):
+        constraints = constraints or OptimizationConstraints()
+        sectors = sectors or {}
+        clean = self._clean_returns(returns)
+        tickers = list(clean.columns)
+        feasibility = self.feasible_constraints(tickers, sectors, constraints, previous_weights)
+        if not feasibility["feasible"]:
+            raise SmartInvestStableError(
+                ErrorCode.OPTIMIZER_INFEASIBLE,
+                "Infeasible optimizer constraints: " + "; ".join(feasibility["reasons"]),
+            )
+        try:
+            result = super().optimize(
+                clean, method, expected_returns, previous_weights, sectors,
+                market_caps, view_confidence, constraints, ppo_timesteps,
+            )
+        except Exception as exc:
+            result = self._deterministic_fallback(
+                clean, tickers, previous_weights, sectors, constraints,
+                f"{type(exc).__name__}: {exc}",
+            )
+        if not result.success and result.method != "deterministic_fallback":
+            result = self._deterministic_fallback(
+                clean, tickers, previous_weights, sectors, constraints,
+                result.message,
+            )
+        audit = self.constraint_audit(result, tickers, sectors, constraints, previous_weights)
+        result.diagnostics = {"feasibility": feasibility, "constraint_audit": audit}
+        if not audit["passed"]:
+            raise SmartInvestStableError(
+                ErrorCode.CONSTRAINT_AUDIT_FAILED,
+                f"Optimizer result failed post-optimization audit: {audit}",
+            )
+        return result
+
+
+# ---------- Digital Twin diagnostics / convergence ----------------------------
+
+_BaseDigitalTwinReport = DigitalTwinReport
+
+
+@dataclass
+class DigitalTwinReport:
+    weights: Dict[str, float]
+    horizon_days: int
+    simulations: int
+    expected_return_pct: float
+    p10_return_pct: float
+    p90_return_pct: float
+    probability_drawdown_over_10pct: float
+    var_95_pct: float
+    cvar_95_pct: float
+    concentration_hhi: float
+    notes: List[str] = field(default_factory=list)
+    bootstrap_diagnostics: Dict[str, Any] = field(default_factory=dict)
+    scenarios: Dict[str, Dict[str, float]] = field(default_factory=dict)
+
+    def to_dict(self):
+        return asdict(self)
+
+
+_BasePortfolioDigitalTwin = PortfolioDigitalTwin
+
+
+class PortfolioDigitalTwin(_BasePortfolioDigitalTwin):
+    def simulate(self, returns: pd.DataFrame, weights: Dict[str, float],
+                 horizon_days: int = SecureConfig.MC_HORIZON,
+                 simulations: int = SecureConfig.MC_SIMULATIONS,
+                 seed: int = DEFAULT_RANDOM_SEED):
+        report = super().simulate(returns, weights, horizon_days, simulations, seed)
+        history = returns.dropna(how="all").fillna(0.0)
+        if len(history) < 126:
+            report.notes.append("Limited history (<126 observations): Digital Twin confidence is reduced.")
+        tickers = list(history.columns)
+        w = np.asarray([weights.get(t, 0.0) for t in tickers], dtype=float)
+        if len(history):
+            portfolio_daily = history.to_numpy(dtype=float) @ w
+            report.bootstrap_diagnostics = {
+                "history_rows": len(history),
+                "daily_mean_pct": round(float(np.mean(portfolio_daily)) * 100, 5),
+                "daily_vol_pct": round(float(np.std(portfolio_daily, ddof=1)) * 100, 5)
+                    if len(portfolio_daily) > 1 else 0.0,
+                "effective_blocks": max(1, len(history) // 5),
+                "seed": seed,
+            }
+            # Deterministic stress scenarios; these are transformations of
+            # observed covariance/volatility, not fabricated market observations.
+            vol = float(np.std(portfolio_daily, ddof=1)) if len(portfolio_daily) > 1 else 0.0
+            mean = float(np.mean(portfolio_daily))
+            report.scenarios = {
+                "observed_mean": {"horizon_return_pct": round(mean * horizon_days * 100, 3)},
+                "one_sigma_down": {"horizon_return_pct": round((mean - vol) * horizon_days * 100, 3)},
+                "two_sigma_down": {"horizon_return_pct": round((mean - 2 * vol) * horizon_days * 100, 3)},
+                "flat_return": {"horizon_return_pct": 0.0},
+            }
+        return report
+
+
+_BaseTwinOptimizationResult = TwinOptimizationResult
+
+
+@dataclass
+class TwinOptimizationResult:
+    optimization: OptimizationResult
+    digital_twin: DigitalTwinReport
+    iterations: int
+    adjustments: List[str]
+    convergence: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self):
+        return asdict(self)
+
+
+def optimize_with_digital_twin(
+        optimizer: PortfolioOptimizer, twin: PortfolioDigitalTwin, returns: pd.DataFrame,
+        method: str, expected_returns: Dict[str, float], previous_weights: Optional[Dict[str, float]],
+        sectors: Dict[str, str], market_caps: Dict[str, float], view_confidence: Dict[str, float],
+        constraints: OptimizationConstraints, max_drawdown_probability: float = 25.0,
+        max_iterations: int = 4) -> TwinOptimizationResult:
+    current = OptimizationConstraints(**asdict(constraints))
+    adjustments: List[str] = []
+    opt = None
+    simulation = None
+    previous_probability = None
+    stable_count = 0
+    converged = False
+    reason = "max_iterations"
+    for iteration in range(1, max_iterations + 1):
+        opt = optimizer.optimize(
+            returns, method, expected_returns, previous_weights,
+            sectors, market_caps, view_confidence, current,
+        )
+        simulation = twin.simulate(returns, opt.weights)
+        pdd = simulation.probability_drawdown_over_10pct
+        if pdd <= max_drawdown_probability:
+            converged, reason = True, "risk_limit_met"
+            break
+        if previous_probability is not None and abs(pdd - previous_probability) < 0.5:
+            stable_count += 1
+        else:
+            stable_count = 0
+        if stable_count >= 2:
+            reason = "risk_probability_plateau"
+            break
+        previous_probability = pdd
+        old_cash = current.min_cash
+        current.min_cash = min(0.60, current.min_cash + 0.08)
+        current.max_position = max(0.08, current.max_position * 0.88)
+        current.max_sector = max(0.25, current.max_sector * 0.92)
+        adjustments.append(
+            f"Iteration {iteration}: P(DD>10%)={pdd:.1f}% > "
+            f"{max_drawdown_probability:.1f}%; cash floor "
+            f"{old_cash:.0%}->{current.min_cash:.0%}; caps tightened."
+        )
+    assert opt is not None and simulation is not None
+    return TwinOptimizationResult(
+        opt, simulation, iteration, adjustments,
+        {"converged": converged, "reason": reason,
+         "drawdown_probability_limit_pct": max_drawdown_probability,
+         "stable_iterations": stable_count},
+    )
+
+
+# ---------- Backtest audit ----------------------------------------------------
+
+_BaseBacktestResult = BacktestResult
+
+
+@dataclass
+class BacktestResult:
+    start_date: str
+    end_date: str
+    total_return_pct: float
+    annual_return_pct: float
+    annual_volatility_pct: float
+    sharpe: float
+    sortino: float
+    max_drawdown_pct: float
+    total_turnover: float
+    total_cost_pct: float
+    rebalance_count: int
+    stop_loss_count: int
+    final_cash_weight: float
+    stop_loss_events: List[StopLossEvent]
+    equity_curve: Dict[str, float]
+    audit: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self):
+        return asdict(self)
+
+
+_BaseStrategyBacktester = StrategyBacktester
+
+
+class StrategyBacktester(_BaseStrategyBacktester):
+    def run(self, prices: pd.DataFrame, weight_provider: Callable[..., Dict[str, float]], *args, **kwargs):
+        result = super().run(prices, weight_provider, *args, **kwargs)
+        curve = pd.Series(result.equity_curve, dtype=float)
+        curve.index = pd.to_datetime(curve.index)
+        curve = curve.sort_index()
+        rets = curve.pct_change().dropna()
+        rolling = {}
+        if len(rets) >= 63:
+            rf_daily = SecureConfig.RISK_FREE_RATE / 252
+            roll_mean = rets.rolling(63).mean()
+            roll_std = rets.rolling(63).std()
+            roll_sharpe = (roll_mean - rf_daily) / roll_std.replace(0, np.nan) * math.sqrt(252)
+            downside_sq = rets.where(rets < 0, 0.0).pow(2).rolling(63).mean()
+            roll_sortino = (roll_mean - rf_daily) / np.sqrt(downside_sq).replace(0, np.nan) * math.sqrt(252)
+            roll_dd = curve / curve.rolling(63, min_periods=1).max() - 1
+            rolling = {
+                "rolling_63d_sharpe_latest": _safe_float(roll_sharpe.iloc[-1]),
+                "rolling_63d_sortino_latest": _safe_float(roll_sortino.iloc[-1]),
+                "rolling_63d_drawdown_latest_pct": (
+                    round(float(roll_dd.iloc[-1]) * 100, 3) if len(roll_dd) else None
+                ),
+            }
+        clean_prices = prices.replace([np.inf, -np.inf], np.nan).ffill().dropna()
+        buy_hold = {}
+        attribution = {}
+        if len(clean_prices) >= 2:
+            per_ticker = clean_prices.iloc[-1] / clean_prices.iloc[0] - 1
+            buy_hold_return = float(per_ticker.mean())
+            buy_hold["equal_weight_total_return_pct"] = round(buy_hold_return * 100, 3)
+            buy_hold["strategy_minus_buy_hold_pct"] = round(result.total_return_pct - buy_hold_return * 100, 3)
+            attribution = {
+                str(t): round(float(r) / max(len(per_ticker), 1) * 100, 3)
+                for t, r in per_ticker.items()
+            }
+        result.audit = {
+            "buy_and_hold_baseline": buy_hold,
+            "rolling_metrics": rolling,
+            "turnover_per_rebalance": (
+                round(result.total_turnover / result.rebalance_count, 6)
+                if result.rebalance_count else 0.0
+            ),
+            "ticker_buy_hold_attribution_pct": attribution,
+            "transaction_costs_applied": True,
+            "trailing_stop_events": result.stop_loss_count,
+        }
+        return result
+
+
+# ---------- Reporting / reproducibility --------------------------------------
+
+def _dependency_versions() -> Dict[str, Optional[str]]:
+    names = ["numpy", "pandas", "scipy", "scikit-learn", "xgboost",
+             "tensorflow", "yfinance", "requests"]
+    out = {}
+    for name in names:
+        try:
+            out[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            out[name] = None
+    return out
+
+
+def _config_hash(config: StableRuntimeConfig, extra: Dict[str, Any]) -> str:
+    payload = json.dumps({"runtime": asdict(config), "extra": extra},
+                         sort_keys=True, default=_jsonable).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:16]
+
+
+def render_html_report(report: Dict[str, Any]) -> str:
+    # Deliberately dependency-free HTML for Colab portability.
+    import html
+    esc = html.escape
+    meta = report.get("reproducibility", {})
+    rows = []
+    for item in report.get("tickers", []):
+        decision = item.get("memo", {}).get("scores", {}).get("decision", "NO_RECOMMENDATION")
+        conviction = item.get("prediction", {}).get("conviction_score", "")
+        gates = "; ".join(item.get("gate_reasons", item.get("gates", {}).get("reasons", [])))
+        rows.append(
+            f"<tr><td>{esc(str(item.get('ticker','')))}</td>"
+            f"<td>{esc(str(decision))}</td><td>{esc(str(conviction))}</td>"
+            f"<td>{esc(gates)}</td></tr>"
+        )
+    gov_rows = []
+    for item in report.get("model_governance", []):
+        gov_rows.append(
+            "<tr>" + "".join(
+                f"<td>{esc(str(item.get(k,'')))}</td>"
+                for k in ("ticker", "model", "hit_rate_30d", "hit_rate_90d",
+                          "live_weight", "quarantined")
+            ) + "</tr>"
+        )
+    portfolio = report.get("portfolio_optimization") or {}
+    backtest = report.get("strategy_backtest") or {}
+    return f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>SmartInvest 5.1 Stable Report</title>
+<style>
+body{{font-family:Arial,sans-serif;max-width:1200px;margin:30px auto;padding:0 18px;color:#1d1d1f}}
+table{{border-collapse:collapse;width:100%;margin:12px 0 28px}}th,td{{border:1px solid #ddd;padding:8px;text-align:left}}
+th{{background:#f5f5f7}}pre{{white-space:pre-wrap;background:#f5f5f7;padding:12px;border-radius:8px}}
+.small{{color:#666;font-size:12px}}
+</style></head><body>
+<h1>SmartInvest 5.1 Stable</h1>
+<p class="small">Generated: {esc(str(report.get("generated_at","")))}</p>
+<h2>Portfolio summary</h2><pre>{esc(json.dumps(portfolio, indent=2, default=_jsonable))}</pre>
+<h2>Ticker decisions & gates</h2>
+<table><tr><th>Ticker</th><th>Decision</th><th>Conviction</th><th>Gate reasons</th></tr>{''.join(rows)}</table>
+<h2>Model governance</h2>
+<table><tr><th>Ticker</th><th>Model</th><th>30d hit</th><th>90d hit</th><th>Weight</th><th>Quarantined</th></tr>{''.join(gov_rows)}</table>
+<h2>Backtest summary</h2><pre>{esc(json.dumps(backtest, indent=2, default=_jsonable))}</pre>
+<h2>Reproducibility</h2><pre>{esc(json.dumps(meta, indent=2, default=_jsonable))}</pre>
+<p class="small">Research software; not financial advice.</p>
+</body></html>"""
+
+
+
+# ---------- Performance modes -------------------------------------------------
+
+_ACTIVE_ANALYSIS_MODE = AnalysisMode.STANDARD
+_BaseModelEnsemble = ModelEnsemble
+
+
+class ModelEnsemble(_BaseModelEnsemble):
+    """BETA 4 ensemble with bounded compute profiles.
+
+    fast:     RF + Ridge (+ XGBoost if available), no Transformer.
+    standard: same ensemble plus a reduced-epoch Transformer.
+    deep:     full BETA 4 model sizes / Transformer epochs.
+    """
+
+    def fit(self, X: pd.DataFrame, y: pd.Series) -> "ModelEnsemble":
+        self.feature_cols = list(X.columns)
+        Xs = self.scaler.fit_transform(X.values)
+        mode = _ACTIVE_ANALYSIS_MODE
+        rf_estimators = 120 if mode == AnalysisMode.FAST else 200 if mode == AnalysisMode.STANDARD else 250
+        xgb_estimators = 120 if mode == AnalysisMode.FAST else 200 if mode == AnalysisMode.STANDARD else 250
+        candidates: Dict[str, Any] = {
+            "random_forest": RandomForestRegressor(
+                n_estimators=rf_estimators, max_depth=7, min_samples_leaf=5,
+                max_features=0.8, n_jobs=-1, random_state=DEFAULT_RANDOM_SEED
+            ),
+            "ridge": Ridge(alpha=2.0),
+        }
+        if XGBOOST_OK:
+            candidates["xgboost"] = xgb.XGBRegressor(
+                n_estimators=xgb_estimators, max_depth=4, learning_rate=0.035,
+                subsample=0.8, colsample_bytree=0.8, reg_lambda=2.0,
+                objective="reg:squarederror", random_state=DEFAULT_RANDOM_SEED, verbosity=0
+            )
+        if TF_OK and mode != AnalysisMode.FAST:
+            epochs = min(5, SecureConfig.TRANSFORMER_EPOCHS) if mode == AnalysisMode.STANDARD else SecureConfig.TRANSFORMER_EPOCHS
+            candidates["transformer"] = TimeSeriesTransformerRegressor(
+                epochs=epochs, seed=DEFAULT_RANDOM_SEED
+            )
+        self.models = {}
+        for name, model in candidates.items():
+            try:
+                model.fit(Xs, y.values)
+                self.models[name] = model
+            except Exception as exc:
+                log(f"{name} unavailable for this fit: {type(exc).__name__}: {exc}", "WARN")
+        if not self.models:
+            raise SmartInvestStableError(ErrorCode.INTERNAL_ERROR, "No ensemble model could be fitted.")
+        self.weights = {name: 1 / len(self.models) for name in self.models}
+        return self
+
+
+# ---------- Stable orchestrator ----------------------------------------------
+
+_BaseSmartInvest51Beta4 = SmartInvest51Beta4
+
+
+class SmartInvest51Stable(_BaseSmartInvest51Beta4):
+    def __init__(self, use_llm: bool = False, mode: str = "standard",
+                 runtime: Optional[StableRuntimeConfig] = None):
+        self.runtime = (runtime or StableRuntimeConfig.from_env(mode)).validate()
+        global _ACTIVE_ANALYSIS_MODE
+        _ACTIVE_ANALYSIS_MODE = self.runtime.mode
+        random.seed(self.runtime.random_seed)
+        np.random.seed(self.runtime.random_seed)
+        try:
+            if TF_OK:
+                tf.keras.utils.set_random_seed(self.runtime.random_seed)
+        except Exception:
+            pass
+        self.data = DataIntegrityEngine(runtime=self.runtime)
+        self.governance = ModelGovernance(runtime=self.runtime)
+        self.fundamentals = FundamentalEngine()
+        self.events = EventEngine()
+        self.macro = MacroEngine()
+        self.committee = InvestmentCommittee()
+        self.optimizer = PortfolioOptimizer() if SCIPY_OK else None
+        self.twin = PortfolioDigitalTwin()
+        self.backtester = StrategyBacktester()
+        self.use_llm = use_llm
+
+    def analyze_ticker(self, ticker: str, peer_universe: Sequence[str], macro: MacroReport,
+                       portfolio_weight: float = 0.0, horizon: int = 5,
+                       base_max_position: float = 0.25):
+        ticker = _validate_ticker(ticker)
+        # BETA 4 method resolves the globally replaced stable engines/functions.
+        result = super().analyze_ticker(
+            ticker, peer_universe, macro, portfolio_weight, horizon, base_max_position
+        )
+        if "validation" in result:
+            validation = result["validation"]
+            if not validation.get("minimum_folds_met", False):
+                result["actionable"] = False
+                result["directional_trade_allowed"] = False
+                result.setdefault("gate_reasons", []).append(
+                    "Minimum purged walk-forward fold evidence not met."
+                )
+        return result
+
+    def run(self, tickers: Sequence[str], current_weights: Optional[Dict[str, float]] = None,
+            optimizer_method: str = "black_litterman", horizon: int = 5,
+            max_position: float = 0.25, max_sector: float = 0.45,
+            max_turnover: float = 0.20, min_cash: float = 0.02,
+            twin_drawdown_probability_limit: float = 25.0,
+            run_strategy_backtest: bool = True, backtest_method: str = "risk_parity",
+            output_json: Optional[str] = "smartinvest_5_1_stable_report.json",
+            output_html: Optional[str] = "smartinvest_5_1_stable_report.html"):
+        cleaned = [_validate_ticker(t) for t in tickers]
+        cleaned = list(dict.fromkeys(cleaned))
+        if not cleaned:
+            raise SmartInvestStableError(ErrorCode.INPUT_INVALID, "At least one ticker is required.")
+        if not (1 <= horizon <= 63):
+            raise SmartInvestStableError(ErrorCode.INPUT_INVALID, "horizon must be in [1,63].")
+        for name, value in (("max_position", max_position), ("max_sector", max_sector),
+                            ("max_turnover", max_turnover), ("min_cash", min_cash)):
+            _validate_fraction(value, name)
+
+        # Keep BETA 4 orchestration semantics. Parallel ticker analysis is
+        # intentionally conservative because TensorFlow training can be unsafe
+        # under aggressive threading in notebook runtimes.
+        report = super().run(
+            cleaned, current_weights=current_weights,
+            optimizer_method=optimizer_method, horizon=horizon,
+            max_position=max_position, max_sector=max_sector,
+            max_turnover=max_turnover, min_cash=min_cash,
+            twin_drawdown_probability_limit=twin_drawdown_probability_limit,
+            run_strategy_backtest=run_strategy_backtest,
+            backtest_method=backtest_method, output_json=None,
+        )
+        now = datetime.now(timezone.utc).isoformat()
+        feature_flags = {
+            "purged_walk_forward": True,
+            "embargo": True,
+            "model_quarantine": True,
+            "governance_weight_smoothing": True,
+            "optimizer_constraint_audit": True,
+            "digital_twin_bootstrap_diagnostics": True,
+            "strategy_backtest_audit": True,
+            "llm_explanation": bool(self.use_llm),
+            "transformer_enabled": bool(TF_OK and self.runtime.mode != AnalysisMode.FAST),
+        }
+        report["version"] = APP_VERSION
+        report["schema_version"] = SCHEMA_VERSION
+        report["generated_at"] = now
+        report["status"] = ErrorCode.OK.value
+        report["analysis_mode"] = self.runtime.mode.value
+        report["portfolio_summary"] = {
+            "requested_tickers": cleaned,
+            "actionable_count": sum(bool(x.get("actionable")) for x in report.get("tickers", [])),
+            "directional_trade_count": sum(bool(x.get("directional_trade_allowed")) for x in report.get("tickers", [])),
+        }
+        report["validation_summary"] = {
+            x["ticker"]: {
+                "folds": len(x.get("validation", {}).get("folds", [])),
+                "hit_rate": x.get("validation", {}).get("overall_directional_accuracy"),
+                "hit_rate_ci_95": x.get("validation", {}).get("hit_rate_ci_95"),
+                "baselines": x.get("validation", {}).get("baselines", {}),
+                "leakage_audit": x.get("validation", {}).get("leakage_audit", {}),
+            } for x in report.get("tickers", []) if "validation" in x
+        }
+        report["gate_reasons"] = {
+            x["ticker"]: x.get("gates", {}).get("reasons", x.get("gate_reasons", []))
+            for x in report.get("tickers", [])
+        }
+        report["optimizer_diagnostics"] = (
+            report.get("portfolio_optimization", {})
+            .get("optimization", {}).get("diagnostics", {})
+            if report.get("portfolio_optimization") else {}
+        )
+        report["backtest_summary"] = report.get("strategy_backtest")
+        report["reproducibility"] = {
+            "smartinvest_version": APP_VERSION,
+            "model_configuration_hash": _config_hash(
+                self.runtime,
+                {"horizon": horizon, "optimizer_method": optimizer_method,
+                 "max_position": max_position, "max_sector": max_sector,
+                 "max_turnover": max_turnover, "min_cash": min_cash},
+            ),
+            "random_seed": self.runtime.random_seed,
+            "data_timestamp": now,
+            "dependencies": _dependency_versions(),
+            "optimizer_method": optimizer_method,
+            "active_feature_flags": feature_flags,
+        }
+        if output_json:
+            try:
+                _atomic_write_text(
+                    output_json,
+                    json.dumps(report, indent=2, sort_keys=True, default=_jsonable),
+                )
+            except OSError as exc:
+                raise SmartInvestStableError(
+                    ErrorCode.REPORT_WRITE_FAILED, f"Cannot write JSON report: {exc}", cause=exc
+                ) from exc
+        if output_html:
+            try:
+                _atomic_write_text(output_html, render_html_report(report))
+            except OSError as exc:
+                raise SmartInvestStableError(
+                    ErrorCode.REPORT_WRITE_FAILED, f"Cannot write HTML report: {exc}", cause=exc
+                ) from exc
+        return report
+
+
+def run_smartinvest_51(
+    tickers: Sequence[str],
+    weights: Optional[Sequence[float]] = None,
+    optimizer_method: str = "black_litterman",
+    use_llm: bool = False,
+    mode: str = "standard",
+    output_json: Optional[str] = "smartinvest_5_1_stable_report.json",
+    output_html: Optional[str] = "smartinvest_5_1_stable_report.html",
+    run_strategy_backtest: bool = True,
+    **kwargs: Any,
+) -> Dict[str, Any]:
+    """Stable Colab/Jupyter entry point.
+
+    Example:
+        report = run_smartinvest_51(
+            ["AAPL", "MSFT", "NVDA"],
+            optimizer_method="black_litterman",
+            mode="standard",
+        )
+    """
+    current = None
+    tickers_clean = [_validate_ticker(t) for t in tickers]
+    if weights is not None:
+        if len(weights) != len(tickers_clean):
+            raise SmartInvestStableError(ErrorCode.INPUT_INVALID, "weights must match tickers.")
+        clean_weights = [float(w) for w in weights]
+        if any((not np.isfinite(w) or w < 0) for w in clean_weights):
+            raise SmartInvestStableError(ErrorCode.INPUT_INVALID, "weights must be finite and non-negative.")
+        if sum(clean_weights) > 1.000001:
+            raise SmartInvestStableError(ErrorCode.INPUT_INVALID, "weights cannot sum above 1.0.")
+        current = {t: w for t, w in zip(tickers_clean, clean_weights)}
+        current["CASH"] = max(0.0, 1.0 - sum(clean_weights))
+    system = SmartInvest51Stable(use_llm=use_llm, mode=mode)
+    return system.run(
+        tickers_clean, current_weights=current,
+        optimizer_method=optimizer_method,
+        output_json=output_json, output_html=output_html,
+        run_strategy_backtest=run_strategy_backtest, **kwargs,
+    )
+
+
+def run_smartinvest_beta4(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+    """Compatibility alias. Stable hardening is used for new runs."""
+    return run_smartinvest_51(*args, **kwargs)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=APP_VERSION)
+    parser.add_argument("--tickers", nargs="+", required=True)
+    parser.add_argument("--weights", nargs="+", type=float)
+    parser.add_argument("--optimizer", default="black_litterman",
+                        choices=("risk_parity", "max_sortino", "black_litterman", "ppo"))
+    parser.add_argument("--mode", default="standard", choices=("fast", "standard", "deep"))
+    parser.add_argument("--output-json", default="smartinvest_5_1_stable_report.json")
+    parser.add_argument("--output-html", default="smartinvest_5_1_stable_report.html")
+    parser.add_argument("--use-llm", action="store_true")
+    parser.add_argument("--no-backtest", action="store_true")
+    args = parser.parse_args()
+    run_smartinvest_51(
+        args.tickers, args.weights, args.optimizer, args.use_llm, args.mode,
+        args.output_json, args.output_html, not args.no_backtest,
+    )
+
+
+if __name__ == "__main__" and not IN_COLAB and "--tickers" in sys.argv:
+    main()
